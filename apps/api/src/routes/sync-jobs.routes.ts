@@ -1,0 +1,536 @@
+import { Router } from "express";
+import type { Request, Response, NextFunction } from "express";
+import { prisma } from "@repo-sync/db";
+import { authenticate } from "../middleware/auth.js";
+import { AppError } from "../middleware/error-handler.js";
+import { syncQueue } from "../lib/sync-queue.js";
+import { GithubAppService } from "../lib/github-app.js";
+
+export const syncJobsRouter = Router();
+
+// Protect all routes
+syncJobsRouter.use(authenticate);
+
+/**
+ * POST /manual-sync
+ * Creates a PushEvent from a selected main-repo commit and starts dry-run jobs
+ * for selected child repositories/files.
+ */
+syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const {
+      mainRepoId,
+      targetRepoIds,
+      commitSha,
+      commitShas,
+      filePaths,
+    } = req.body as {
+      mainRepoId: string;
+      targetRepoIds: string[];
+      commitSha?: string;
+      commitShas?: string[];
+      filePaths: string[];
+    };
+
+    const selectedCommitShas = Array.from(new Set(commitShas?.length ? commitShas : commitSha ? [commitSha] : []));
+
+    if (!mainRepoId || selectedCommitShas.length === 0) {
+      return next(AppError.badRequest("mainRepoId and at least one commit are required"));
+    }
+    if (!Array.isArray(targetRepoIds) || targetRepoIds.length === 0) {
+      return next(AppError.badRequest("Select at least one child repository"));
+    }
+    if (!Array.isArray(filePaths) || filePaths.length === 0) {
+      return next(AppError.badRequest("Select at least one file"));
+    }
+
+    const mainRepo = await prisma.repository.findUnique({
+      where: { id: mainRepoId },
+    });
+
+    if (!mainRepo || mainRepo.role !== "MAIN" || !mainRepo.isActive) {
+      return next(AppError.badRequest("Main repository must be an active MAIN repository"));
+    }
+
+    const targetRepos = await prisma.repository.findMany({
+      where: {
+        id: { in: targetRepoIds },
+        role: "CLIENT",
+        isActive: true,
+      },
+    });
+
+    if (targetRepos.length !== targetRepoIds.length) {
+      return next(AppError.badRequest("Every selected child repository must be active and registered"));
+    }
+
+    const branchCommits = await GithubAppService.listCommits(
+      mainRepo.installationId,
+      mainRepo.fullName,
+      mainRepo.branch
+    );
+    const selectedIndexes = selectedCommitShas.map((sha) => branchCommits.findIndex((commit) => commit.sha === sha));
+
+    if (selectedIndexes.some((index) => index === -1)) {
+      return next(AppError.badRequest("Every selected commit must exist in the configured main branch commit list"));
+    }
+
+    const newestIndex = Math.min(...selectedIndexes);
+    const oldestIndex = Math.max(...selectedIndexes);
+    const rangeCommits = branchCommits.slice(newestIndex, oldestIndex + 1);
+    const rangeCommitShas = rangeCommits.map((commit) => commit.sha);
+
+    if (rangeCommitShas.length !== selectedCommitShas.length || !rangeCommitShas.every((sha) => selectedCommitShas.includes(sha))) {
+      return next(AppError.badRequest("Selected commits must be contiguous. Select every commit between the oldest and newest commit."));
+    }
+
+    const newestCommit = await GithubAppService.getCommit(
+      mainRepo.installationId,
+      mainRepo.fullName,
+      rangeCommits[0].sha
+    );
+    const oldestCommit = await GithubAppService.getCommit(
+      mainRepo.installationId,
+      mainRepo.fullName,
+      rangeCommits[rangeCommits.length - 1].sha
+    );
+    const comparison = await GithubAppService.compareCommits(
+      mainRepo.installationId,
+      mainRepo.fullName,
+      oldestCommit.parentSha,
+      newestCommit.sha
+    );
+
+    const commitFiles = comparison.files;
+    const validFilePaths = new Set(commitFiles.map((file) => file.filename));
+    const selectedFiles = Array.from(new Set(filePaths));
+    const invalidFiles = selectedFiles.filter((filePath) => !validFilePaths.has(filePath));
+
+    if (invalidFiles.length > 0) {
+      return next(AppError.badRequest(`Selected files are not part of this commit: ${invalidFiles.join(", ")}`));
+    }
+
+    const selectedCommitFiles = commitFiles.filter((file) => selectedFiles.includes(file.filename));
+    const pushEvent = await prisma.$transaction(async (tx) => {
+      const message = rangeCommits.length === 1
+        ? newestCommit.message
+        : `Manual sync range: ${rangeCommits.length} commits from ${oldestCommit.sha.substring(0, 7)} to ${newestCommit.sha.substring(0, 7)}`;
+      const existing = await tx.pushEvent.findUnique({
+        where: { commitSha: newestCommit.sha },
+      });
+
+      const event = existing
+        ? await tx.pushEvent.update({
+            where: { id: existing.id },
+            data: {
+              repositoryId: mainRepo.id,
+              baseSha: oldestCommit.parentSha,
+              branch: mainRepo.branch,
+              authorName: newestCommit.authorName,
+              authorEmail: newestCommit.authorEmail,
+              message,
+              pushedAt: new Date(newestCommit.date),
+              status: "TRIAGED",
+            },
+          })
+        : await tx.pushEvent.create({
+            data: {
+              repositoryId: mainRepo.id,
+              commitSha: newestCommit.sha,
+              baseSha: oldestCommit.parentSha,
+              branch: mainRepo.branch,
+              authorName: newestCommit.authorName,
+              authorEmail: newestCommit.authorEmail,
+              message,
+              pushedAt: new Date(newestCommit.date),
+              status: "TRIAGED",
+            },
+          });
+
+      await tx.pushFile.deleteMany({
+        where: { pushEventId: event.id },
+      });
+
+      await tx.pushFile.createMany({
+        data: selectedCommitFiles.map((file) => ({
+          pushEventId: event.id,
+          filePath: file.filename,
+          changeType: file.status,
+          patch: file.patch || null,
+          additions: file.additions,
+          deletions: file.deletions,
+        })),
+      });
+
+      return tx.pushEvent.findUniqueOrThrow({
+        where: { id: event.id },
+        include: { files: true },
+      });
+    });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.syncJobFile.deleteMany({
+        where: {
+          syncJob: {
+            pushEventId: pushEvent.id,
+            status: { not: "APPLIED" },
+          },
+        },
+      });
+
+      await tx.syncJob.deleteMany({
+        where: {
+          pushEventId: pushEvent.id,
+          status: { not: "APPLIED" },
+        },
+      });
+    });
+
+    const createdJobs = [];
+    for (const targetRepo of targetRepos) {
+      const syncJob = await prisma.syncJob.create({
+        data: {
+          pushEventId: pushEvent.id,
+          targetRepoId: targetRepo.id,
+          status: "PENDING",
+          files: {
+            create: selectedFiles.map((filePath) => ({
+              filePath,
+              mergeResult: "PENDING",
+            })),
+          },
+        },
+        include: {
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      createdJobs.push(syncJob);
+      syncQueue.enqueueDryRun(syncJob.id);
+    }
+
+    res.status(201).json({
+      ok: true,
+      data: {
+        pushEvent,
+        syncJobs: createdJobs,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /push-events/:id/sync-jobs
+ * Creates one SyncJob (and corresponding SyncJobFiles) per target repository.
+ * Enqueues dry-run analysis for each job in the background worker queue.
+ */
+syncJobsRouter.post("/push-events/:id/sync-jobs", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pushEventId = req.params.id as string;
+    const { targetRepoIds, filesByRepo } = req.body as {
+      targetRepoIds: string[];
+      filesByRepo: { [repoId: string]: string[] };
+    };
+
+    if (!targetRepoIds || !Array.isArray(targetRepoIds) || targetRepoIds.length === 0) {
+      return next(AppError.badRequest("targetRepoIds must be a non-empty array"));
+    }
+
+    if (!filesByRepo || typeof filesByRepo !== "object") {
+      return next(AppError.badRequest("filesByRepo must be an object specifying files per repository"));
+    }
+
+    // Verify push event exists
+    const pushEvent = await prisma.pushEvent.findUnique({
+      where: { id: pushEventId },
+    });
+
+    if (!pushEvent) {
+      return next(AppError.notFound("Push event not found"));
+    }
+
+    const pushFiles = await prisma.pushFile.findMany({
+      where: { pushEventId },
+      select: { filePath: true },
+    });
+    const validFilePaths = new Set(pushFiles.map((file) => file.filePath));
+
+    const createdJobs = [];
+
+    // Create jobs in a database transaction to ensure transactional consistency
+    for (const targetRepoId of targetRepoIds) {
+      const selectedFiles = Array.from(new Set(filesByRepo[targetRepoId] || []));
+      if (!selectedFiles || !Array.isArray(selectedFiles) || selectedFiles.length === 0) {
+        return next(AppError.badRequest(`No files selected for repository ${targetRepoId}`));
+      }
+
+      const invalidFiles = selectedFiles.filter((filePath) => !validFilePaths.has(filePath));
+      if (invalidFiles.length > 0) {
+        return next(AppError.badRequest(`Repository ${targetRepoId} selected files that are not part of this push event: ${invalidFiles.join(", ")}`));
+      }
+
+      // Verify target repo exists and is client
+      const targetRepo = await prisma.repository.findUnique({
+        where: { id: targetRepoId },
+      });
+
+      if (!targetRepo) {
+        return next(AppError.notFound(`Target repository ${targetRepoId} not found`));
+      }
+
+      if (targetRepo.role !== "CLIENT" || !targetRepo.isActive) {
+        return next(AppError.badRequest(`Target repository ${targetRepo.fullName} must be an active CLIENT repository`));
+      }
+
+      // Create SyncJob and SyncJobFiles
+      const syncJob = await prisma.syncJob.create({
+        data: {
+          pushEventId,
+          targetRepoId,
+          status: "PENDING",
+          files: {
+            create: selectedFiles.map((filePath) => ({
+              filePath,
+              mergeResult: "PENDING",
+            })),
+          },
+        },
+        include: {
+          files: true,
+          targetRepo: true,
+        },
+      });
+
+      createdJobs.push(syncJob);
+
+      // Enqueue background dry run
+      syncQueue.enqueueDryRun(syncJob.id);
+    }
+
+    res.status(201).json({
+      ok: true,
+      data: createdJobs,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /push-events/:id/sync-jobs
+ * Lists all sync jobs created for a push event, including target repo metadata.
+ */
+syncJobsRouter.get("/push-events/:id/sync-jobs", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pushEventId = req.params.id as string;
+
+    const pushEvent = await prisma.pushEvent.findUnique({
+      where: { id: pushEventId },
+    });
+
+    if (!pushEvent) {
+      return next(AppError.notFound("Push event not found"));
+    }
+
+    const syncJobs = await prisma.syncJob.findMany({
+      where: { pushEventId },
+      include: {
+        targetRepo: true,
+        files: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    res.json({
+      ok: true,
+      data: syncJobs,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /sync-jobs/:id
+ * Fetches full details for a sync job, including files, merge results, and conflict diffs.
+ */
+syncJobsRouter.get("/sync-jobs/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+
+    const syncJob = await prisma.syncJob.findUnique({
+      where: { id },
+      include: {
+        targetRepo: true,
+        pushEvent: {
+          include: {
+            repository: true,
+          },
+        },
+        files: true,
+      },
+    });
+
+    if (!syncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    res.json({
+      ok: true,
+      data: syncJob,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /sync-jobs/:id/retry-dry-run
+ * Retries a sync job dry-run analysis.
+ */
+syncJobsRouter.post("/sync-jobs/:id/retry-dry-run", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+
+    const syncJob = await prisma.syncJob.findUnique({
+      where: { id },
+    });
+
+    if (!syncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    // Reset status to PENDING and clean any previous error message
+    const updatedSyncJob = await prisma.syncJob.update({
+      where: { id },
+      data: {
+        status: "PENDING",
+        errorMessage: null,
+      },
+    });
+
+    // Reset all files back to PENDING mergeResult
+    await prisma.syncJobFile.updateMany({
+      where: { syncJobId: id },
+      data: {
+        mergeResult: "PENDING",
+        conflictDiff: null,
+      },
+    });
+
+    // Re-enqueue dry run
+    syncQueue.enqueueDryRun(id);
+
+    res.json({
+      ok: true,
+      data: updatedSyncJob,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /push-events/:id/apply
+ * Merges a list of CLEAN SyncJobs in the background.
+ */
+syncJobsRouter.post("/push-events/:id/apply", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pushEventId = req.params.id as string;
+    const { syncJobIds, autoMerge } = req.body as { syncJobIds: string[]; autoMerge?: boolean };
+
+    if (!syncJobIds || !Array.isArray(syncJobIds) || syncJobIds.length === 0) {
+      return next(AppError.badRequest("syncJobIds must be a non-empty array"));
+    }
+
+    const pushEvent = await prisma.pushEvent.findUnique({
+      where: { id: pushEventId },
+    });
+
+    if (!pushEvent) {
+      return next(AppError.notFound("Push event not found"));
+    }
+
+    const enqueuedJobs = [];
+
+    for (const jobId of syncJobIds) {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: jobId },
+        include: {
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      if (!job) {
+        return next(AppError.notFound(`Sync job ${jobId} not found`));
+      }
+
+      if (job.pushEventId !== pushEventId) {
+        return next(AppError.badRequest(`Sync job ${jobId} is not linked to this push event`));
+      }
+
+      const canApply = job.status === "CLEAN";
+      const canMergeExistingPr = Boolean(autoMerge && job.status === "APPLIED" && job.prNumber);
+      if (!canApply && !canMergeExistingPr) {
+        return next(AppError.badRequest(`Sync job ${jobId} is ${job.status}; only CLEAN jobs can be merged`));
+      }
+
+      if (!job.targetRepo.isActive || job.targetRepo.role !== "CLIENT") {
+        return next(AppError.badRequest(`Sync job ${jobId} target must be an active CLIENT repository`));
+      }
+
+      if (job.files.length === 0) {
+        return next(AppError.badRequest(`Sync job ${jobId} has no selected files`));
+      }
+
+      // Enqueue job execution
+      syncQueue.enqueueApply(jobId, { autoMerge });
+      enqueuedJobs.push(job);
+    }
+
+    res.json({
+      ok: true,
+      data: enqueuedJobs,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /sync-jobs/:id/status
+ * Lightweight polling status endpoint.
+ */
+syncJobsRouter.get("/sync-jobs/:id/status", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+
+    const job = await prisma.syncJob.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        prUrl: true,
+        prNumber: true,
+        errorMessage: true,
+      },
+    });
+
+    if (!job) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    res.json({
+      ok: true,
+      data: job,
+    });
+  } catch (error) {
+    next(error);
+  }
+});

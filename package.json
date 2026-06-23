@@ -1,0 +1,28 @@
+{
+  "name": "repo-sync-platform",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web,worker -c blue,green,yellow \"npm run dev -w apps/api\" \"npm run dev -w apps/web\" \"npm run dev -w apps/worker\"",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "dev:worker": "npm run dev -w apps/worker",
+    "db:generate": "npm run generate -w packages/db",
+    "db:migrate": "npm run migrate -w packages/db",
+    "db:push": "npm run push -w packages/db",
+    "db:seed": "npm run seed -w packages/db",
+    "build": "npm run build -w packages/db && npm run build -w packages/shared && npm run build -w apps/api && npm run build -w apps/web",
+    "lint": "eslint . --ext .ts,.tsx",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

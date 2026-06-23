@@ -1,0 +1,156 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────
+// Module 1: Auth & Users
+// ─────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String?
+  avatarUrl    String?  @map("avatar_url")
+  githubLogin  String?  @unique @map("github_login")
+  githubToken  String?  @map("github_token") // encrypted at rest
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model AppSetting {
+  key       String   @id
+  value     String
+  encrypted Boolean  @default(false)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_settings")
+}
+
+// ─────────────────────────────────────────────────────────
+// Module 2: Repositories
+// ─────────────────────────────────────────────────────────
+
+enum RepoRole {
+  MAIN
+  CLIENT
+}
+
+model Repository {
+  id             String   @id @default(uuid())
+  githubOwner    String   @map("github_owner")
+  githubName     String   @map("github_name")
+  fullName       String   @unique @map("full_name")
+  installationId Int      @map("installation_id")
+  role           RepoRole
+  branch         String   @default("master")
+  description    String?
+  customerName   String?  @map("customer_name")
+  isActive       Boolean  @default(true) @map("is_active")
+  autoMergeEnabled Boolean  @default(false) @map("auto_merge_enabled")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  pushEvents     PushEvent[]
+  syncJobs       SyncJob[]
+
+  @@map("repositories")
+}
+
+// ─────────────────────────────────────────────────────────
+// Module 3: Push Events
+// ─────────────────────────────────────────────────────────
+
+enum PushStatus {
+  NEW
+  TRIAGED
+  COMPLETED
+}
+
+model PushEvent {
+  id           String     @id @default(uuid())
+  repositoryId String     @map("repository_id")
+  repository   Repository @relation(fields: [repositoryId], references: [id])
+  commitSha    String     @unique @map("commit_sha")
+  baseSha      String     @map("base_sha")
+  branch       String
+  authorName   String     @map("author_name")
+  authorEmail  String     @map("author_email")
+  message      String
+  pushedAt     DateTime   @map("pushed_at")
+  status       PushStatus @default(NEW)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  files        PushFile[]
+  syncJobs     SyncJob[]
+
+  @@map("push_events")
+}
+
+model PushFile {
+  id          String    @id @default(uuid())
+  pushEventId String    @map("push_event_id")
+  pushEvent   PushEvent @relation(fields: [pushEventId], references: [id])
+  filePath    String    @map("file_path")
+  changeType  String    @map("change_type")
+  patch       String?
+  additions   Int
+  deletions   Int
+
+  @@map("push_files")
+}
+
+// ─────────────────────────────────────────────────────────
+// Module 4: Sync Targeting & Dry Run Conflict Check
+// ─────────────────────────────────────────────────────────
+
+enum SyncJobStatus {
+  PENDING
+  DRY_RUN_RUNNING
+  CLEAN
+  CONFLICT
+  APPLYING
+  APPLIED
+  FAILED
+}
+
+enum MergeResult {
+  PENDING
+  CLEAN
+  MERGED
+  CONFLICT
+}
+
+model SyncJob {
+  id           String        @id @default(uuid())
+  pushEventId  String        @map("push_event_id")
+  pushEvent    PushEvent     @relation(fields: [pushEventId], references: [id])
+  targetRepoId String        @map("target_repo_id")
+  targetRepo   Repository    @relation(fields: [targetRepoId], references: [id])
+  status       SyncJobStatus @default(PENDING)
+  branchName   String?       @map("branch_name")
+  prUrl        String?       @map("pr_url")
+  prNumber     Int?          @map("pr_number")
+  errorMessage String?       @map("error_message")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  files        SyncJobFile[]
+
+  @@map("sync_jobs")
+}
+
+model SyncJobFile {
+  id           String      @id @default(uuid())
+  syncJobId    String      @map("sync_job_id")
+  syncJob      SyncJob     @relation(fields: [syncJobId], references: [id], onDelete: Cascade)
+  filePath     String      @map("file_path")
+  mergeResult  MergeResult @default(PENDING) @map("merge_result")
+  conflictDiff String?     @map("conflict_diff")
+
+  @@map("sync_job_files")
+}

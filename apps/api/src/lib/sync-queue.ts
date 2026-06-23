@@ -1,0 +1,490 @@
+import { prisma } from "@repo-sync/db";
+import { GithubAppService } from "./github-app.js";
+import { execFileSync } from "child_process";
+import fs from "fs";
+import path from "path";
+import { config } from "../config.js";
+
+function runGit(args: string[], cwd: string, options: { stdio?: "ignore" | "pipe" } = {}) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: options.stdio === "ignore" ? "ignore" : "pipe",
+    maxBuffer: 50 * 1024 * 1024,
+  }) as string;
+}
+
+function sanitizeBranchPart(value: string) {
+  return value.replace(/[^a-zA-Z0-9._/-]/g, "-").replace(/\/+/g, "/").replace(/^-+|-+$/g, "");
+}
+
+type ApplyOptions = {
+  autoMerge?: boolean;
+};
+
+class SyncQueue {
+  private activeJobs = new Set<string>();
+
+  /**
+   * Enqueues a sync job to run its dry-run analysis in the background.
+   */
+  public enqueueDryRun(syncJobId: string) {
+    setImmediate(async () => {
+      await this.processDryRun(syncJobId);
+    });
+  }
+
+  private async processDryRun(syncJobId: string) {
+    if (this.activeJobs.has(syncJobId)) return;
+    this.activeJobs.add(syncJobId);
+
+    console.log(`[SyncQueue] Starting dry-run for SyncJob ${syncJobId}`);
+
+    try {
+      // 1. Update status to DRY_RUN_RUNNING
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: { status: "DRY_RUN_RUNNING" },
+      });
+
+      // Fetch job details
+      const job = await prisma.syncJob.findUnique({
+        where: { id: syncJobId },
+        include: {
+          pushEvent: {
+            include: {
+              repository: true,
+            },
+          },
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      if (!job) {
+        console.error(`[SyncQueue] SyncJob ${syncJobId} not found`);
+        return;
+      }
+
+      if (await GithubAppService.isMockMode()) {
+        throw new Error("GitHub App is not configured. Dry-run requires real repository access.");
+      }
+
+      await this.runRealDryRun(job);
+    } catch (err: any) {
+      console.error(`[SyncQueue] Unexpected error in SyncJob ${syncJobId}:`, err);
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: {
+          status: "FAILED",
+          errorMessage: err.message || "Unexpected dry-run failure",
+        },
+      });
+    } finally {
+      this.activeJobs.delete(syncJobId);
+    }
+  }
+
+  private async runRealDryRun(job: any) {
+    console.log(`[SyncQueue] Running Real Dry-Run for SyncJob ${job.id}`);
+
+    const jobId = job.id;
+    const tempDir = path.join(process.cwd(), "temp-jobs", jobId);
+    
+    try {
+      // 1. Create temp directory
+      fs.mkdirSync(tempDir, { recursive: true });
+
+      const targetDir = path.join(tempDir, "target");
+      const targetRepo = job.targetRepo;
+      const mainRepo = job.pushEvent.repository;
+
+      // 2. Get tokens
+      const targetToken = await GithubAppService.getInstallationToken(targetRepo.installationId);
+      const mainToken = await GithubAppService.getInstallationToken(mainRepo.installationId);
+
+      // 3. Clone target repo
+      const targetUrl = `https://x-access-token:${targetToken}@github.com/${targetRepo.fullName}.git`;
+      runGit(["clone", "--branch", targetRepo.branch, "--depth", "50", targetUrl, "target"], tempDir, { stdio: "ignore" });
+
+      // 4. Add upstream remote and fetch commits
+      const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
+      runGit(["remote", "add", "upstream", mainUrl], targetDir);
+      runGit(["fetch", "upstream", job.pushEvent.baseSha, job.pushEvent.commitSha], targetDir, { stdio: "ignore" });
+
+      // 5. Build patch file for selected files only
+      const patchFile = path.join(tempDir, "selected.patch");
+      const selectedPaths = job.files.map((f: any) => f.filePath);
+      const selectedPatch = runGit(["diff", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      fs.writeFileSync(patchFile, selectedPatch);
+
+      // 6. Checkout temporary branch for checking
+      runGit(["checkout", "-b", `dry-run-${jobId}`], targetDir);
+
+      // 7. Check if patch applies cleanly
+      let patchApplies = true;
+      try {
+        runGit(["apply", "--check", "--3way", patchFile], targetDir, { stdio: "ignore" });
+      } catch (err) {
+        patchApplies = false;
+      }
+
+      let hasConflict = false;
+
+      if (patchApplies) {
+        // Patch applies cleanly! Now check CLEAN vs MERGED per file
+        for (const jobFile of job.files) {
+          let mergeResult: "CLEAN" | "MERGED" = "CLEAN";
+          try {
+            // Check if file has unrelated changes on target branch since baseSha
+            runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
+          } catch (diffErr) {
+            // Unrelated changes exist -> MERGED
+            mergeResult = "MERGED";
+          }
+
+          await prisma.syncJobFile.update({
+            where: { id: jobFile.id },
+            data: { mergeResult },
+          });
+        }
+      } else {
+        // Patch has conflict! Write 3way patch to find conflicted files
+        try {
+          runGit(["apply", "--3way", patchFile], targetDir, { stdio: "ignore" });
+        } catch (applyErr) {
+          // ignore apply failures; we check the files now
+        }
+
+        for (const jobFile of job.files) {
+          const filePathOnDisk = path.join(targetDir, jobFile.filePath);
+          let mergeResult: "CLEAN" | "MERGED" | "CONFLICT" = "CLEAN";
+          let conflictDiff: string | null = null;
+
+          if (fs.existsSync(filePathOnDisk)) {
+            const content = fs.readFileSync(filePathOnDisk, "utf8");
+            if (content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>")) {
+              mergeResult = "CONFLICT";
+              hasConflict = true;
+              
+              // Extract the conflict hunk
+              const lines = content.split("\n");
+              const hunkLines: string[] = [];
+              let insideConflict = false;
+              for (const line of lines) {
+                if (line.startsWith("<<<<<<<")) {
+                  insideConflict = true;
+                }
+                if (insideConflict) {
+                  hunkLines.push(line);
+                }
+                if (line.startsWith(">>>>>>>")) {
+                  insideConflict = false;
+                }
+              }
+              conflictDiff = hunkLines.join("\n");
+            } else {
+              // No conflict markers, check if it was modified on target
+              try {
+                runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
+              } catch (diffErr) {
+                mergeResult = "MERGED";
+              }
+            }
+          } else {
+            // File does not exist (perhaps deleted), treat as CLEAN / unmodified
+            mergeResult = "CLEAN";
+          }
+
+          await prisma.syncJobFile.update({
+            where: { id: jobFile.id },
+            data: { mergeResult, conflictDiff },
+          });
+        }
+      }
+
+      await prisma.syncJob.update({
+        where: { id: jobId },
+        data: {
+          status: hasConflict ? "CONFLICT" : "CLEAN",
+        },
+      });
+
+      console.log(`[SyncQueue] Real Dry-Run finished for SyncJob ${jobId}. Status: ${hasConflict ? "CONFLICT" : "CLEAN"}`);
+    } finally {
+      // 8. Clean up temporary directory
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (rmErr) {
+        console.error(`[SyncQueue] Failed to clean up ${tempDir}:`, rmErr);
+      }
+    }
+  }
+
+  // ─── Apply Sync Jobs ──────────────────────────────────
+
+  public enqueueApply(syncJobId: string, options: ApplyOptions = {}) {
+    setImmediate(async () => {
+      await this.processApply(syncJobId, options);
+    });
+  }
+
+  private async processApply(syncJobId: string, options: ApplyOptions = {}) {
+    if (this.activeJobs.has(syncJobId)) return;
+    this.activeJobs.add(syncJobId);
+
+    console.log(`[SyncQueue] Starting apply for SyncJob ${syncJobId}`);
+
+    try {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: syncJobId },
+        include: {
+          pushEvent: {
+            include: {
+              repository: true,
+            },
+          },
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      if (!job) {
+        console.error(`[SyncQueue] SyncJob ${syncJobId} not found`);
+        return;
+      }
+
+      if (job.status !== "CLEAN" && !(options.autoMerge && job.status === "APPLIED" && job.prNumber)) {
+        throw new Error(`Only CLEAN sync jobs can be applied. Current status is ${job.status}.`);
+      }
+
+      if (await GithubAppService.isMockMode()) {
+        throw new Error("GitHub App is not configured. Apply requires real repository access.");
+      }
+
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: { status: "APPLYING", errorMessage: null },
+      });
+
+      if (options.autoMerge && job.status === "APPLIED" && job.prNumber) {
+        await this.mergeExistingPullRequest(job, true);
+      } else {
+        await this.runRealApply(job, options);
+      }
+    } catch (err: any) {
+      console.error(`[SyncQueue] Unexpected error in SyncJob ${syncJobId}:`, err);
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: {
+          status: "FAILED",
+          errorMessage: err.message || "Unexpected apply failure",
+        },
+      });
+    } finally {
+      this.activeJobs.delete(syncJobId);
+      
+      // Rollup PushEvent completion check
+      try {
+        const job = await prisma.syncJob.findUnique({
+          where: { id: syncJobId },
+          select: { pushEventId: true },
+        });
+        if (job) {
+          await this.checkPushEventCompletion(job.pushEventId);
+        }
+      } catch (rollupErr) {
+        console.error(`[SyncQueue] Failed to execute PushEvent rollup completion:`, rollupErr);
+      }
+    }
+  }
+
+  private async checkPushEventCompletion(pushEventId: string) {
+    // Count jobs that are not in terminal states (APPLIED, CONFLICT, FAILED)
+    const activeJobsCount = await prisma.syncJob.count({
+      where: {
+        pushEventId,
+        status: {
+          in: ["PENDING", "DRY_RUN_RUNNING", "APPLYING"],
+        },
+      },
+    });
+
+    if (activeJobsCount === 0) {
+      await prisma.pushEvent.update({
+        where: { id: pushEventId },
+        data: { status: "COMPLETED" },
+      });
+      console.log(`[SyncQueue] PushEvent ${pushEventId} status updated to COMPLETED`);
+    }
+  }
+
+  private async mergeExistingPullRequest(job: any, required: boolean) {
+    const targetRepo = job.targetRepo;
+    const targetToken = await GithubAppService.getInstallationToken(targetRepo.installationId);
+    const mergeUrl = `https://api.github.com/repos/${targetRepo.fullName}/pulls/${job.prNumber}/merge`;
+    const mergeResponse = await fetch(mergeUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${targetToken}`,
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Repo-Sync-Bot",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        merge_method: "squash",
+        commit_title: `Merge pull request #${job.prNumber} from ${job.branchName || "repo-sync"}`,
+      }),
+    });
+
+    if (!mergeResponse.ok) {
+      const errText = await mergeResponse.text();
+      const message = `GitHub PR merge failed for #${job.prNumber}: ${errText}`;
+      if (required) {
+        throw new Error(message);
+      }
+      console.warn(`[SyncQueue] ${message}`);
+      return false;
+    }
+
+    await prisma.syncJob.update({
+      where: { id: job.id },
+      data: {
+        status: "APPLIED",
+        errorMessage: null,
+      },
+    });
+
+    console.log(`[SyncQueue] PR #${job.prNumber} merged for SyncJob ${job.id}.`);
+    return true;
+  }
+
+  private async runRealApply(job: any, options: ApplyOptions = {}) {
+    console.log(`[SyncQueue] Running Real Apply for SyncJob ${job.id}`);
+
+    const jobId = job.id;
+    const tempDir = path.join(process.cwd(), "temp-jobs", `apply-${jobId}`);
+    
+    try {
+      // 1. Create fresh temp directory
+      fs.mkdirSync(tempDir, { recursive: true });
+
+      const targetRepo = job.targetRepo;
+      const mainRepo = job.pushEvent.repository;
+      const targetDir = path.join(tempDir, "target");
+
+      // 2. Get tokens
+      const targetToken = await GithubAppService.getInstallationToken(targetRepo.installationId);
+      const mainToken = await GithubAppService.getInstallationToken(mainRepo.installationId);
+
+      // 3. Clone target repo fresh
+      const targetUrl = `https://x-access-token:${targetToken}@github.com/${targetRepo.fullName}.git`;
+      runGit(["clone", "--branch", targetRepo.branch, "--depth", "50", targetUrl, "target"], tempDir, { stdio: "ignore" });
+
+      // 4. Add upstream remote and fetch commits
+      const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
+      runGit(["remote", "add", "upstream", mainUrl], targetDir);
+      runGit(["fetch", "upstream", job.pushEvent.baseSha, job.pushEvent.commitSha], targetDir, { stdio: "ignore" });
+
+      // 5. Build patch file for selected files only
+      const patchFile = path.join(tempDir, "selected.patch");
+      const selectedPaths = job.files.map((f: any) => f.filePath);
+      const selectedPatch = runGit(["diff", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      fs.writeFileSync(patchFile, selectedPatch);
+
+      if (selectedPatch.trim().length === 0) {
+        throw new Error("Selected files produced an empty patch; refusing to create an empty sync PR.");
+      }
+
+      // 6. Create sync branch
+      const shortSha = job.pushEvent.commitSha.substring(0, 7);
+      const branchName = sanitizeBranchPart(`sync/main-${shortSha}-${jobId.substring(0, 8)}`);
+      runGit(["checkout", "-b", branchName], targetDir);
+
+      // 7. Apply patch
+      try {
+        runGit(["apply", "--index", "--3way", patchFile], targetDir, { stdio: "ignore" });
+      } catch (applyErr) {
+        throw new Error(`Git apply patch failed. The target branch may have changed since dry-run.`);
+      }
+
+      // 8. Commit
+      const commitMsg = `Sync from main @ ${shortSha}: ${job.pushEvent.message}`;
+      runGit(["-c", "user.name=Sync Bot", "-c", "user.email=sync-bot@yourcompany.com", "commit", "-m", commitMsg], targetDir);
+
+      // 9. Push branch
+      runGit(["push", "origin", branchName], targetDir, { stdio: "ignore" });
+
+      // 10. Open Pull Request via GitHub REST API
+      const fileListMarkdown = job.files.map((f: any) => `- \`${f.filePath}\``).join("\n");
+      const linkBack = `[Push Event Detail](${config.webUrl}/dashboard/push-events/${job.pushEventId})`;
+      const prBody = `Automated sync from main repository.\n\nSynced files:\n${fileListMarkdown}\n\nLink to original push: ${linkBack}`;
+
+      const pullsUrl = `https://api.github.com/repos/${targetRepo.fullName}/pulls`;
+      const prResponse = await fetch(pullsUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${targetToken}`,
+          "Accept": "application/vnd.github.v3+json",
+          "User-Agent": "Repo-Sync-Bot",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          title: commitMsg,
+          head: branchName,
+          base: targetRepo.branch,
+          body: prBody,
+        }),
+      });
+
+      if (!prResponse.ok) {
+        const errText = await prResponse.text();
+        throw new Error(`Failed to create Pull Request: ${errText}`);
+      }
+
+      const prJson = (await prResponse.json()) as any;
+      const prUrl = prJson.html_url;
+      const prNumber = prJson.number;
+
+      await prisma.syncJob.update({
+        where: { id: jobId },
+        data: {
+          branchName,
+          prUrl,
+          prNumber,
+        },
+      });
+
+      // 11. Optionally auto-merge the Pull Request
+      const shouldMerge = options.autoMerge || targetRepo.autoMergeEnabled;
+      if (shouldMerge) {
+        await this.mergeExistingPullRequest(
+          { ...job, prNumber, branchName, targetRepo },
+          Boolean(options.autoMerge)
+        );
+      }
+
+      // 12. Save results
+      await prisma.syncJob.update({
+        where: { id: jobId },
+        data: {
+          status: "APPLIED",
+          branchName,
+          prUrl,
+          prNumber,
+        },
+      });
+
+      console.log(`[SyncQueue] Real Apply finished for SyncJob ${jobId}. PR #${prNumber} created.`);
+    } finally {
+      // 13. Clean up temporary directory
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (rmErr) {
+        console.error(`[SyncQueue] Failed to clean up ${tempDir}:`, rmErr);
+      }
+    }
+  }
+}
+
+export const syncQueue = new SyncQueue();

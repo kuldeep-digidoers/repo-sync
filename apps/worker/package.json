@@ -1,0 +1,23 @@
+{
+  "name": "@repo-sync/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@repo-sync/db": "*",
+    "@repo-sync/shared": "*",
+    "bullmq": "^5.40.0",
+    "dotenv": "^16.5.0",
+    "ioredis": "^5.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.3"
+  }
+}
