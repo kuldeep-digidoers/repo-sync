@@ -187,7 +187,7 @@ export function HistoryPage() {
       </div>
 
       {/* Filter Bar */}
-      <div className="bg-card border border-border rounded-xl p-4 space-y-4">
+      <div className="bg-card border border-border rounded-xl p-3 space-y-4">
         <div className="flex items-center gap-2 text-xs font-semibold text-text-secondary border-b border-border/40 pb-2">
           <Filter className="w-4 h-4 text-accent" />
           Filter Logs
@@ -306,7 +306,7 @@ export function HistoryPage() {
           ))}
         </div>
       ) : pushEvents.length === 0 ? (
-        <div className="bg-card border border-border rounded-xl p-12 text-center max-w-xl mx-auto space-y-4">
+        <div className="bg-card border border-border rounded-xl p-8 text-center max-w-xl mx-auto space-y-4">
           <div className="w-12 h-12 rounded-full bg-border/20 flex items-center justify-center mx-auto">
             <Database className="w-6 h-6 text-text-muted" />
           </div>
@@ -405,7 +405,7 @@ export function HistoryPage() {
                                     {event.syncJobs.map((job) => (
                                       <div
                                         key={job.id}
-                                        className="bg-card border border-border/80 rounded-lg p-3.5 flex flex-wrap items-center justify-between gap-4"
+                                        className="bg-card border border-border/80 rounded-lg p-3 flex flex-wrap items-center justify-between gap-4"
                                       >
                                         <div className="flex items-center gap-3">
                                           <div className="space-y-0.5">

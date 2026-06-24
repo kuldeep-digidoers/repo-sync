@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -60,6 +60,7 @@ export function PushEventDetailPage() {
   const [activeTab, setActiveTab] = useState<"diff" | "sync">("diff");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [openCommitShas, setOpenCommitShas] = useState<string[]>([]);
+  const defaultOpenEventIdRef = useRef<string | null>(null);
 
   // Sync targeting states
   const [selectedRepoIds, setSelectedRepoIds] = useState<string[]>([]);
@@ -138,27 +139,35 @@ export function PushEventDetailPage() {
       : null;
     const currentFileStillExists = event.files.some((file) => file.id === selectedFileId);
 
-    if (commitGroups.length > 0 && openCommitShas.length === 0) {
+    if (commitGroups.length > 0 && defaultOpenEventIdRef.current !== event.id) {
       setOpenCommitShas([commitGroups[0].sha]);
+      defaultOpenEventIdRef.current = event.id;
     }
 
     if (!selectedFileId || !currentFileStillExists) {
       setSelectedFileId(firstGroupedFile?.id || event.files[0].id);
     }
-  }, [event, selectedFileId, openCommitShas.length]);
+  }, [event, selectedFileId]);
 
   // Initialize file selections when repositories and files are loaded
   useEffect(() => {
-    if (event?.files && clientRepos.length > 0) {
+    const targetRepos = Array.from(new Map(syncJobs
+      .map((job) => job.targetRepo)
+      .filter((repo): repo is Repository => Boolean(repo?.id))
+      .map((repo) => [repo.id, repo])).values());
+    const visibleClientRepos = targetRepos.length > 0 ? targetRepos : clientRepos;
+
+    if (event?.files && visibleClientRepos.length > 0) {
       const initialSelection: Record<string, string[]> = {};
       const filePaths = event.files.map((f) => f.filePath);
       
-      clientRepos.forEach((repo) => {
+      visibleClientRepos.forEach((repo) => {
         initialSelection[repo.id] = [...filePaths];
       });
       setFileSelection(initialSelection);
+      setSelectedRepoIds(visibleClientRepos.map((repo) => repo.id));
     }
-  }, [event, repositories]);
+  }, [event, repositories, syncJobs]);
 
   // Mutation: Create Sync Jobs (Dry Run)
   const createSyncJobsMutation = useMutation({
@@ -359,6 +368,11 @@ export function PushEventDetailPage() {
   const conflictJobs = syncJobs.filter((job) => job.status === "CONFLICT");
   const appliedJobs = syncJobs.filter((job) => job.status === "APPLIED");
   const pendingReviewJobs = syncJobs.filter((job) => job.status === "PENDING" || job.status === "DRY_RUN_RUNNING");
+  const targetReposFromJobs = Array.from(new Map(syncJobs
+    .map((job) => job.targetRepo)
+    .filter((repo): repo is Repository => Boolean(repo?.id))
+    .map((repo) => [repo.id, repo])).values());
+  const scopedClientRepos = targetReposFromJobs.length > 0 ? targetReposFromJobs : clientRepos;
 
   // Group files by top-level folder for Diff Viewer
   const groupedFiles: Record<string, FileChange[]> = {};
@@ -419,7 +433,7 @@ export function PushEventDetailPage() {
   };
 
   return (
-    <div className="space-y-6 animate-fade-in max-w-7xl mx-auto">
+    <div className="space-y-4 animate-fade-in max-w-none mx-auto">
       {/* Back Button */}
       <button
         onClick={() => navigate("/dashboard")}
@@ -430,7 +444,7 @@ export function PushEventDetailPage() {
       </button>
 
       {/* Header Panel */}
-      <div className="bg-card border border-border rounded-xl p-5 relative overflow-hidden">
+      <div className="bg-card border border-border rounded-xl p-3 relative overflow-hidden">
         <div className="absolute top-0 right-0 w-32 h-32 bg-accent/5 rounded-full blur-2xl pointer-events-none" />
         <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
           <div className="space-y-1.5 flex-1">
@@ -466,16 +480,6 @@ export function PushEventDetailPage() {
               </span>
             </div>
           </div>
-
-          <a
-            href={`https://github.com/${event.repository?.fullName}/commit/${event.commitSha}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-3xs px-2.5 py-1.5 rounded-lg border border-border hover:bg-card-hover text-text-secondary hover:text-text-primary transition-colors self-start"
-          >
-            <span>GitHub Commit</span>
-            <ExternalLink className="w-3 h-3" />
-          </a>
         </div>
       </div>
 
@@ -483,7 +487,7 @@ export function PushEventDetailPage() {
       <div className="flex border-b border-border">
         <button
           onClick={() => setActiveTab("diff")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-semibold border-b-2 transition-all ${
+          className={`flex items-center gap-2 px-3 py-2.5 text-xs font-semibold border-b-2 transition-all ${
             activeTab === "diff"
               ? "border-accent text-accent"
               : "border-transparent text-text-secondary hover:text-text-primary"
@@ -494,7 +498,7 @@ export function PushEventDetailPage() {
         </button>
         <button
           onClick={() => setActiveTab("sync")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-semibold border-b-2 transition-all ${
+          className={`flex items-center gap-2 px-3 py-2.5 text-xs font-semibold border-b-2 transition-all ${
             activeTab === "sync"
               ? "border-accent text-accent"
               : "border-transparent text-text-secondary hover:text-text-primary"
@@ -507,46 +511,58 @@ export function PushEventDetailPage() {
 
       {/* Tab Contents */}
       {activeTab === "diff" && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* Left: Files List */}
-          <div className="space-y-3">
+          <div className="space-y-2">
             <h2 className="text-xs font-bold text-text-muted uppercase tracking-wider">
               Modified Files List
             </h2>
-            <div className="space-y-3 max-h-[70vh] overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-[76vh] overflow-y-auto pr-0.5">
               {commitFileGroups.length > 0 ? (
                 commitFileGroups.map((group, index) => {
                   const isOpen = openCommitShas.includes(group.sha);
                   return (
                     <div key={group.sha} className="border border-border rounded-lg bg-card overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => toggleCommitGroup(group.sha)}
-                        className="w-full flex items-start gap-2 p-3 text-left hover:bg-card-hover transition-colors"
-                      >
-                        <ChevronRight className={`w-4 h-4 text-accent mt-0.5 flex-shrink-0 transition-transform ${isOpen ? "rotate-90" : ""}`} />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-3xs px-2 py-0.5 rounded bg-page border border-border text-text-primary">
-                              {group.sha.substring(0, 7)}
-                            </span>
-                            {index === 0 && (
-                              <span className="text-[10px] uppercase font-bold text-accent bg-accent/10 border border-accent/20 rounded px-1.5 py-0.5">
-                                Head
+                      <div className="flex items-start gap-2 p-2.5 hover:bg-card-hover transition-colors">
+                        <button
+                          type="button"
+                          onClick={() => toggleCommitGroup(group.sha)}
+                          className="min-w-0 flex-1 flex items-start gap-2 text-left"
+                        >
+                          <ChevronRight className={`w-4 h-4 text-accent mt-0.5 flex-shrink-0 transition-transform ${isOpen ? "rotate-90" : ""}`} />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-3xs px-2 py-0.5 rounded bg-page border border-border text-text-primary">
+                                {group.sha.substring(0, 7)}
                               </span>
-                            )}
+                              {index === 0 && (
+                                <span className="text-[10px] uppercase font-bold text-accent bg-accent/10 border border-accent/20 rounded px-1.5 py-0.5">
+                                  Head
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-3xs text-text-secondary mt-1 truncate" title={group.message}>
+                              {group.message.split("\n")[0]}
+                            </p>
+                            <p className="text-[10px] text-text-muted mt-0.5">
+                              {group.files.length} file{group.files.length === 1 ? "" : "s"} affected
+                            </p>
                           </div>
-                          <p className="text-3xs text-text-secondary mt-1 truncate" title={group.message}>
-                            {group.message.split("\n")[0]}
-                          </p>
-                          <p className="text-[10px] text-text-muted mt-0.5">
-                            {group.files.length} file{group.files.length === 1 ? "" : "s"} affected
-                          </p>
-                        </div>
-                      </button>
+                        </button>
+                        <a
+                          href={`https://github.com/${event.repository?.fullName}/commit/${group.sha}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[10px] px-1.5 py-1 rounded border border-border text-accent hover:bg-accent/10 hover:border-accent/30 transition-colors flex-shrink-0"
+                          title={`Open commit ${group.sha.substring(0, 7)} on GitHub`}
+                        >
+                          <span>Commit</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                      </div>
 
                       {isOpen && (
-                        <div className="space-y-1 p-2 border-t border-border bg-page/30">
+                        <div className="space-y-1 p-1.5 border-t border-border bg-page/30">
                           {group.files.map((groupFile) => {
                             const file = fileByPath.get(groupFile.filePath);
                             if (!file) return null;
@@ -555,7 +571,7 @@ export function PushEventDetailPage() {
                               <button
                                 key={`${group.sha}-${groupFile.filePath}`}
                                 onClick={() => setSelectedFileId(file.id)}
-                                className={`w-full text-left p-2.5 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
+                                className={`w-full text-left p-2 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
                                   isSelected
                                     ? "bg-accent/10 border-accent/40 text-text-primary font-medium"
                                     : "bg-card border-border hover:border-border-light text-text-secondary hover:bg-card-hover"
@@ -590,7 +606,7 @@ export function PushEventDetailPage() {
                           <button
                             key={file.id}
                             onClick={() => setSelectedFileId(file.id)}
-                            className={`w-full text-left p-2.5 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
+                            className={`w-full text-left p-2 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
                               isSelected
                                 ? "bg-accent/10 border-accent/40 text-text-primary font-medium"
                                 : "bg-card border-border hover:border-border-light text-text-secondary hover:bg-card-hover"
@@ -614,7 +630,7 @@ export function PushEventDetailPage() {
           </div>
 
           {/* Right: Code Diff Viewer */}
-          <div className="lg:col-span-2 space-y-3">
+          <div className="lg:col-span-2 space-y-2">
             <div className="flex items-center justify-between border-b border-border pb-1">
               <h2 className="text-xs font-bold text-text-muted uppercase tracking-wider">Diff Viewer</h2>
               {selectedFile && (
@@ -626,7 +642,7 @@ export function PushEventDetailPage() {
 
             {selectedFile ? (
               <div className="bg-card border border-border rounded-xl overflow-hidden">
-                <div className="px-4 py-3 bg-page/50 border-b border-border flex items-center justify-between gap-4">
+                <div className="px-3 py-2 bg-page/50 border-b border-border flex items-center justify-between gap-4">
                   <span className="font-mono text-xs text-text-primary truncate" title={selectedFile.filePath}>
                     {selectedFile.filePath}
                   </span>
@@ -640,17 +656,17 @@ export function PushEventDetailPage() {
                   </div>
                 </div>
 
-                <div className="p-4 bg-page overflow-x-auto">
+                <div className="p-3 bg-page overflow-x-auto">
                   {selectedFile.patch ? (
                     <pre className="font-mono text-2xs leading-relaxed select-text space-y-0.5">
                       {selectedFile.patch.split("\n").map((line, idx) => {
                         let lineClass = "text-text-secondary";
                         if (line.startsWith("+")) {
-                          lineClass = "bg-success/10 text-success font-medium border-l-2 border-success pl-1 -mx-4 px-4";
+                          lineClass = "bg-success/10 text-success font-medium border-l-2 border-success pl-1 -mx-3 px-3";
                         } else if (line.startsWith("-")) {
-                          lineClass = "bg-danger/10 text-danger font-medium border-l-2 border-danger pl-1 -mx-4 px-4";
+                          lineClass = "bg-danger/10 text-danger font-medium border-l-2 border-danger pl-1 -mx-3 px-3";
                         } else if (line.startsWith("@@")) {
-                          lineClass = "text-accent/60 bg-accent/5 font-semibold -mx-4 px-4 py-0.5";
+                          lineClass = "text-accent/60 bg-accent/5 font-semibold -mx-3 px-3 py-0.5";
                         }
                         return (
                           <div key={idx} className={`${lineClass} whitespace-pre`}>
@@ -667,12 +683,12 @@ export function PushEventDetailPage() {
                 </div>
               </div>
             ) : (
-              <div className="bg-card border border-border rounded-xl p-12 text-center text-text-muted italic text-xs">
+              <div className="bg-card border border-border rounded-xl p-8 text-center text-text-muted italic text-xs">
                 Select a file to inspect.
               </div>
             )}
 
-            <div className="bg-card border border-border rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="bg-card border border-border rounded-xl p-3 flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="space-y-1">
                 <h3 className="text-sm font-semibold text-text-primary flex items-center gap-2">
                   <GitMerge className="w-4 h-4 text-success" />
@@ -733,11 +749,11 @@ export function PushEventDetailPage() {
       )}
 
       {activeTab === "sync" && (
-        <div className="space-y-8">
+        <div className="space-y-4">
           {/* Top section: Configuration options */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             {/* Column 1: Repo Selector */}
-            <div className="bg-card border border-border rounded-xl p-5 space-y-4">
+            <div className="bg-card border border-border rounded-xl p-3 space-y-3">
               <h3 className="text-sm font-semibold text-text-primary flex items-center gap-2">
                 <Server className="w-4 h-4 text-accent" />
                 Target Client Repositories
@@ -746,14 +762,14 @@ export function PushEventDetailPage() {
                 Select the target client repositories you wish to deploy code synchronization to.
               </p>
 
-              {clientRepos.length > 0 ? (
+              {scopedClientRepos.length > 0 ? (
                 <div className="space-y-2 pt-2">
-                  {clientRepos.map((repo) => {
+                  {scopedClientRepos.map((repo) => {
                     const isChecked = selectedRepoIds.includes(repo.id);
                     return (
                       <label
                         key={repo.id}
-                        className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
+                        className={`flex items-center gap-3 p-2.5 rounded-lg border cursor-pointer transition-all ${
                           isChecked
                             ? "bg-accent/10 border-accent/30 text-text-primary"
                             : "bg-page/50 border-border hover:border-border-light text-text-secondary"
@@ -779,13 +795,13 @@ export function PushEventDetailPage() {
                 </div>
               ) : (
                 <div className="p-4 bg-page/50 border border-dashed border-border rounded-lg text-center text-text-muted text-xs">
-                  No active client repositories. Go to Repositories list to add client targets.
+                  No target client repositories were selected for this sync.
                 </div>
               )}
             </div>
 
             {/* Column 2 & 3: File Sync targeting matrix */}
-            <div className="lg:col-span-2 bg-card border border-border rounded-xl p-5 space-y-4 flex flex-col justify-between">
+            <div className="lg:col-span-2 bg-card border border-border rounded-xl p-3 space-y-3 flex flex-col justify-between">
               <div className="space-y-3">
                 <h3 className="text-sm font-semibold text-text-primary flex items-center gap-2">
                   <Settings className="w-4 h-4 text-accent" />
@@ -802,7 +818,7 @@ export function PushEventDetailPage() {
                         <tr className="bg-card border-b border-border text-3xs text-text-muted uppercase font-bold tracking-wider">
                           <th className="p-3">File Path</th>
                           {selectedRepoIds.map((repoId) => {
-                            const repo = clientRepos.find((r) => r.id === repoId);
+                            const repo = scopedClientRepos.find((r) => r.id === repoId);
                             return (
                               <th key={repoId} className="p-3 text-center min-w-[100px] truncate max-w-[120px]">
                                 <div className="flex flex-col items-center gap-1">
@@ -847,7 +863,7 @@ export function PushEventDetailPage() {
                     </table>
                   </div>
                 ) : (
-                  <div className="p-10 bg-page/50 border border-dashed border-border rounded-lg text-center text-text-muted text-xs leading-relaxed">
+                  <div className="p-6 bg-page/50 border border-dashed border-border rounded-lg text-center text-text-muted text-xs leading-relaxed">
                     No target repositories selected. <br />
                     Check client targets on the left to activate file mapping.
                   </div>
@@ -879,7 +895,7 @@ export function PushEventDetailPage() {
           </div>
 
           {/* Sync Jobs Results Stream */}
-          <div className="space-y-4">
+          <div className="space-y-3">
             <div className="flex items-center justify-between border-b border-border pb-2 gap-4">
               <h3 className="text-sm font-semibold text-text-primary flex items-center gap-2">
                 <GitMerge className="w-4.5 h-4.5 text-accent" />
@@ -915,11 +931,11 @@ export function PushEventDetailPage() {
             </div>
 
             {syncJobs.length > 0 ? (
-              <div className="space-y-4">
+              <div className="space-y-3">
                 {syncJobs.map((job) => (
                   <div
                     key={job.id}
-                    className="bg-card border border-border rounded-xl p-5 space-y-4"
+                    className="bg-card border border-border rounded-xl p-3 space-y-3"
                   >
                     {/* Job Header Info */}
                     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/40 pb-3">
@@ -975,54 +991,57 @@ export function PushEventDetailPage() {
                     </div>
 
                     {/* Job Files summary */}
-                    {job.errorMessage ? (
-                      <div className="p-3 bg-danger/10 border border-danger/20 rounded-lg text-xs text-danger flex items-start gap-2">
-                        <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-                        <div className="space-y-1">
-                          <p className="font-semibold">Dry-run failure:</p>
-                          <p className="font-mono text-3xs leading-relaxed">{job.errorMessage}</p>
+                    <div className="space-y-4">
+                      {job.errorMessage && (
+                        <div className="p-3 bg-danger/10 border border-danger/20 rounded-lg text-xs text-danger flex items-start gap-2">
+                          <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                          <div className="space-y-1">
+                            <p className="font-semibold">
+                              {job.status === "CONFLICT" ? "Merge conflict:" : "Dry-run failure:"}
+                            </p>
+                            <p className="font-mono text-3xs leading-relaxed">{job.errorMessage}</p>
+                          </div>
                         </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-4">
-                        {/* List of files status */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                          {job.files?.map((file) => {
-                            const isConflict = file.mergeResult === "CONFLICT";
-                            return (
-                              <div
-                                key={file.id}
-                                className={`p-3 rounded-lg border text-xs flex flex-col justify-between gap-2.5 ${
-                                  isConflict
-                                    ? "bg-warning/5 border-warning/30 text-warning"
-                                    : file.mergeResult === "CLEAN"
-                                    ? "bg-success/5 border-success/20 text-success"
-                                    : file.mergeResult === "MERGED"
-                                    ? "bg-accent/5 border-accent/20 text-accent"
-                                    : "bg-page/50 border-border text-text-secondary"
-                                }`}
-                              >
-                                <div className="flex items-start justify-between gap-2 min-w-0">
-                                  <span className="truncate block font-mono text-3xs" title={file.filePath}>
-                                    {file.filePath}
-                                  </span>
-                                  <span className="text-[10px] font-bold uppercase whitespace-nowrap">
-                                    {file.mergeResult}
-                                  </span>
-                                </div>
+                      )}
 
-                                {isConflict && (
-                                  <button
-                                    onClick={() => handleExcludeAndRetry(job, file.filePath)}
-                                    className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 mt-1 self-start"
-                                  >
-                                    Exclude file & retry
-                                  </button>
-                                )}
+                      {/* List of files status */}
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {job.files?.map((file) => {
+                          const isConflict = file.mergeResult === "CONFLICT";
+                          return (
+                            <div
+                              key={file.id}
+                              className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-2 ${
+                                isConflict
+                                  ? "bg-warning/5 border-warning/30 text-warning"
+                                  : file.mergeResult === "CLEAN"
+                                  ? "bg-success/5 border-success/20 text-success"
+                                  : file.mergeResult === "MERGED"
+                                  ? "bg-accent/5 border-accent/20 text-accent"
+                                  : "bg-page/50 border-border text-text-secondary"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2 min-w-0">
+                                <span className="truncate block font-mono text-3xs" title={file.filePath}>
+                                  {file.filePath}
+                                </span>
+                                <span className="text-[10px] font-bold uppercase whitespace-nowrap">
+                                  {file.mergeResult}
+                                </span>
                               </div>
-                            );
-                          })}
-                        </div>
+
+                              {isConflict && (
+                                <button
+                                  onClick={() => handleExcludeAndRetry(job, file.filePath)}
+                                  className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 mt-1 self-start"
+                                >
+                                  Exclude file & retry
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
 
                         {/* Conflict Diff Box */}
                         {job.files?.map((file) => {
@@ -1046,13 +1065,12 @@ export function PushEventDetailPage() {
                           }
                           return null;
                         })}
-                      </div>
-                    )}
+                    </div>
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="bg-card border border-border rounded-xl p-12 text-center text-text-secondary">
+              <div className="bg-card border border-border rounded-xl p-8 text-center text-text-secondary">
                 <div className="w-12 h-12 bg-border rounded-2xl flex items-center justify-center mb-4 mx-auto">
                   <HelpCircle className="w-6 h-6 text-text-muted" />
                 </div>

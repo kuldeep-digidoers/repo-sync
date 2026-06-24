@@ -148,7 +148,7 @@ export function RepositoryDetailPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto space-y-8 animate-fade-in">
+    <div className="max-w-7xl mx-auto space-y-8 animate-fade-in">
       {/* Breadcrumb / Back Button */}
       <button
         onClick={() => navigate("/dashboard/repositories")}
@@ -159,7 +159,7 @@ export function RepositoryDetailPage() {
       </button>
 
       {/* Hero Header */}
-      <div className="bg-card border border-border rounded-xl p-6 relative overflow-hidden">
+      <div className="bg-card border border-border rounded-xl p-4 relative overflow-hidden">
         <div className="absolute top-0 right-0 w-32 h-32 bg-accent/5 rounded-full blur-2xl pointer-events-none" />
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="space-y-1.5">
@@ -204,7 +204,7 @@ export function RepositoryDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Editor Form */}
         <div className="lg:col-span-2 space-y-6">
-          <div className="bg-card border border-border rounded-xl p-6">
+          <div className="bg-card border border-border rounded-xl p-4">
             <h2 className="text-base font-semibold text-text-primary border-b border-border pb-3 mb-5">
               Repository Settings
             </h2>
@@ -334,7 +334,7 @@ export function RepositoryDetailPage() {
 
         {/* Sidebar Info/Placeholder */}
         <div className="space-y-6">
-          <div className="bg-card border border-border rounded-xl p-6 space-y-4">
+          <div className="bg-card border border-border rounded-xl p-4 space-y-4">
             <h3 className="text-sm font-semibold text-text-primary flex items-center gap-2">
               <History className="w-4 h-4 text-accent" />
               Sync Summary
@@ -357,7 +357,7 @@ export function RepositoryDetailPage() {
             </div>
           </div>
 
-          <div className="bg-card border border-border rounded-xl p-6 space-y-4">
+          <div className="bg-card border border-border rounded-xl p-4 space-y-4">
             <h3 className="text-sm font-semibold text-text-primary">GitHub Integration</h3>
             <p className="text-xs text-text-secondary leading-relaxed">
               This repository is authorized via the GitHub App installation ID. The App enforces read/write access to file contents and pull request management.
@@ -367,7 +367,7 @@ export function RepositoryDetailPage() {
       </div>
 
       {/* Sync History Table */}
-      <section className="bg-card border border-border rounded-xl p-6">
+      <section className="bg-card border border-border rounded-xl p-4">
         <h2 className="text-base font-semibold text-text-primary border-b border-border pb-3 mb-4">
           Sync History Log
         </h2>
@@ -378,7 +378,7 @@ export function RepositoryDetailPage() {
             <div className="h-12 bg-page border border-border rounded-lg animate-pulse" />
           </div>
         ) : historyEvents.length === 0 ? (
-          <div className="border border-border/60 rounded-xl p-8 text-center text-xs text-text-muted bg-page/30">
+          <div className="border border-border/60 rounded-xl p-6 text-center text-xs text-text-muted bg-page/30">
             No sync runs recorded yet for this repository.
           </div>
         ) : (

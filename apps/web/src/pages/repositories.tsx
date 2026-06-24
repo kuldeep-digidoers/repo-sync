@@ -249,7 +249,7 @@ export function RepositoriesPage() {
         </Button>
       </div>
 
-      <section className="bg-card border border-border rounded-xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+      <section className="bg-card border border-border rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <Github className="w-4 h-4 text-accent" />
@@ -324,7 +324,7 @@ export function RepositoriesPage() {
             ) : (
               <button
                 onClick={() => openModal("MAIN")}
-                className="w-full border-2 border-dashed border-border hover:border-accent/40 rounded-xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:bg-card/30 group transition-all"
+                className="w-full border-2 border-dashed border-border hover:border-accent/40 rounded-xl p-6 flex flex-col items-center justify-center text-center cursor-pointer hover:bg-card/30 group transition-all"
               >
                 <div className="w-12 h-12 rounded-xl bg-card border border-border group-hover:bg-accent-muted group-hover:border-accent/40 flex items-center justify-center transition-all mb-4">
                   <GitFork className="w-6 h-6 text-text-muted group-hover:text-accent" />
@@ -363,7 +363,7 @@ export function RepositoriesPage() {
                 ))}
               </div>
             ) : (
-              <div className="border-2 border-dashed border-border rounded-xl p-12 flex flex-col items-center justify-center text-center">
+              <div className="border-2 border-dashed border-border rounded-xl p-8 flex flex-col items-center justify-center text-center">
                 <div className="w-12 h-12 rounded-xl bg-card border border-border flex items-center justify-center mb-4">
                   <Building className="w-6 h-6 text-text-muted" />
                 </div>
@@ -516,7 +516,7 @@ export function RepositoriesPage() {
                       })}
                     </div>
                   ) : (
-                    <div className="border border-border/80 rounded-xl p-6 text-center space-y-2 bg-page/40">
+                    <div className="border border-border/80 rounded-xl p-4 text-center space-y-2 bg-page/40">
                       <AlertCircle className="w-8 h-8 text-warning mx-auto" />
                       <h3 className="text-xs font-semibold text-text-primary">No Repositories Found</h3>
                       <p className="text-3xs text-text-muted leading-relaxed max-w-xs mx-auto">
@@ -678,7 +678,7 @@ function RoleCard({
     <button
       type="button"
       onClick={onClick}
-      className={`border rounded-xl p-4 cursor-pointer text-left transition-all flex flex-col gap-2 ${
+      className={`border rounded-xl p-3 cursor-pointer text-left transition-all flex flex-col gap-2 ${
         selected ? "border-accent bg-accent/5" : "border-border hover:border-border-light hover:bg-card-hover"
       }`}
     >
@@ -712,7 +712,7 @@ function RepositoryCard({
   const iconClass = accent === "accent" ? "bg-accent-muted text-accent" : "bg-success/10 text-success";
 
   return (
-    <div className={`bg-card border border-border rounded-xl p-5 ${accentClass} transition-colors flex flex-col justify-between gap-4 group relative`}>
+    <div className={`bg-card border border-border rounded-xl p-4 ${accentClass} transition-colors flex flex-col justify-between gap-4 group relative`}>
       <div className="space-y-3">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-start gap-3 min-w-0">

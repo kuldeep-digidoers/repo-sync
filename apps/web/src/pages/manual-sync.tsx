@@ -187,7 +187,7 @@ export function ManualSyncPage() {
       </div>
 
       {step === 1 && (
-        <section className="bg-card border border-border rounded-xl p-6 space-y-6">
+        <section className="bg-card border border-border rounded-xl p-4 space-y-6">
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="space-y-3">
               <h2 className="text-sm font-semibold text-text-primary flex items-center gap-2">
@@ -299,7 +299,7 @@ export function ManualSyncPage() {
       )}
 
       {step === 2 && (
-        <section className="bg-card border border-border rounded-xl p-6 space-y-5">
+        <section className="bg-card border border-border rounded-xl p-4 space-y-5">
           <div className="flex items-center justify-between gap-4">
             <h2 className="text-sm font-semibold text-text-primary flex items-center gap-2">
               <GitCommit className="w-4 h-4 text-accent" />
@@ -366,7 +366,7 @@ export function ManualSyncPage() {
       )}
 
       {step === 3 && (
-        <section className="bg-card border border-border rounded-xl p-6 space-y-5">
+        <section className="bg-card border border-border rounded-xl p-4 space-y-5">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h2 className="text-sm font-semibold text-text-primary flex items-center gap-2">

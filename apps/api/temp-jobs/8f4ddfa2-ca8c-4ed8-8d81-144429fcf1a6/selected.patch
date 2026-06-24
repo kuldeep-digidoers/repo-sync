@@ -1,0 +1,8 @@
+diff --git a/1.py b/1.py
+index c9550c3..578a339 100644
+--- a/1.py
++++ b/1.py
+@@ -1 +1 @@
+-print('this is one file')
+\ No newline at end of file
++print('this is one file new')

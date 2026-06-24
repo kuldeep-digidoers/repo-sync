@@ -105,7 +105,7 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto space-y-6 animate-fade-in">
+    <div className="max-w-7xl mx-auto space-y-6 animate-fade-in">
       <div>
         <h1 className="text-2xl font-bold text-text-primary">Settings</h1>
         <p className="text-sm text-text-secondary mt-1">
@@ -113,7 +113,7 @@ export function SettingsPage() {
         </p>
       </div>
 
-      <section className="bg-card border border-border rounded-xl p-6 space-y-5">
+      <section className="bg-card border border-border rounded-xl p-4 space-y-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="space-y-2">
             <h2 className="text-base font-semibold text-text-primary flex items-center gap-2">
@@ -179,7 +179,7 @@ export function SettingsPage() {
         </div>
       </section>
 
-      <section className="bg-card border border-border rounded-xl p-5 space-y-4">
+      <section className="bg-card border border-border rounded-xl p-4 space-y-4">
         <button
           type="button"
           onClick={() => setShowAdvanced((value) => !value)}

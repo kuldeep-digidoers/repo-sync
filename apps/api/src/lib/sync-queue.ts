@@ -18,6 +18,12 @@ function sanitizeBranchPart(value: string) {
   return value.replace(/[^a-zA-Z0-9._/-]/g, "-").replace(/\/+/g, "/").replace(/^-+|-+$/g, "");
 }
 
+function formatGitError(err: any) {
+  const stderr = err?.stderr?.toString?.().trim();
+  const stdout = err?.stdout?.toString?.().trim();
+  return stderr || stdout || err?.message || "Unknown git error";
+}
+
 type ApplyOptions = {
   autoMerge?: boolean;
 };
@@ -121,86 +127,45 @@ class SyncQueue {
       // 6. Checkout temporary branch for checking
       runGit(["checkout", "-b", `dry-run-${jobId}`], targetDir);
 
-      // 7. Check if patch applies cleanly
-      let patchApplies = true;
+      const mergeResultsByFile = new Map<string, "CLEAN" | "MERGED">();
+      for (const jobFile of job.files) {
+        let mergeResult: "CLEAN" | "MERGED" = "CLEAN";
+        try {
+          // Check target branch drift before applying the source patch.
+          runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
+        } catch (diffErr) {
+          mergeResult = "MERGED";
+        }
+        mergeResultsByFile.set(jobFile.filePath, mergeResult);
+      }
+
+      // 7. Simulate the exact apply operation used by real merge.
       try {
-        runGit(["apply", "--check", "--3way", patchFile], targetDir, { stdio: "ignore" });
-      } catch (err) {
-        patchApplies = false;
+        runGit(["apply", "--3way", patchFile], targetDir);
+      } catch (applyErr) {
+        // Ignore here; conflict markers in the temp worktree are inspected below.
       }
 
       let hasConflict = false;
 
-      if (patchApplies) {
-        // Patch applies cleanly! Now check CLEAN vs MERGED per file
-        for (const jobFile of job.files) {
-          let mergeResult: "CLEAN" | "MERGED" = "CLEAN";
-          try {
-            // Check if file has unrelated changes on target branch since baseSha
-            runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
-          } catch (diffErr) {
-            // Unrelated changes exist -> MERGED
-            mergeResult = "MERGED";
+      for (const jobFile of job.files) {
+        const filePathOnDisk = path.join(targetDir, jobFile.filePath);
+        let mergeResult: "CLEAN" | "MERGED" | "CONFLICT" = mergeResultsByFile.get(jobFile.filePath) || "CLEAN";
+        let conflictDiff: string | null = null;
+
+        if (fs.existsSync(filePathOnDisk)) {
+          const content = fs.readFileSync(filePathOnDisk, "utf8");
+          if (content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>")) {
+            mergeResult = "CONFLICT";
+            hasConflict = true;
+            conflictDiff = this.extractConflictHunk(content);
           }
-
-          await prisma.syncJobFile.update({
-            where: { id: jobFile.id },
-            data: { mergeResult },
-          });
-        }
-      } else {
-        // Patch has conflict! Write 3way patch to find conflicted files
-        try {
-          runGit(["apply", "--3way", patchFile], targetDir, { stdio: "ignore" });
-        } catch (applyErr) {
-          // ignore apply failures; we check the files now
         }
 
-        for (const jobFile of job.files) {
-          const filePathOnDisk = path.join(targetDir, jobFile.filePath);
-          let mergeResult: "CLEAN" | "MERGED" | "CONFLICT" = "CLEAN";
-          let conflictDiff: string | null = null;
-
-          if (fs.existsSync(filePathOnDisk)) {
-            const content = fs.readFileSync(filePathOnDisk, "utf8");
-            if (content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>")) {
-              mergeResult = "CONFLICT";
-              hasConflict = true;
-              
-              // Extract the conflict hunk
-              const lines = content.split("\n");
-              const hunkLines: string[] = [];
-              let insideConflict = false;
-              for (const line of lines) {
-                if (line.startsWith("<<<<<<<")) {
-                  insideConflict = true;
-                }
-                if (insideConflict) {
-                  hunkLines.push(line);
-                }
-                if (line.startsWith(">>>>>>>")) {
-                  insideConflict = false;
-                }
-              }
-              conflictDiff = hunkLines.join("\n");
-            } else {
-              // No conflict markers, check if it was modified on target
-              try {
-                runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
-              } catch (diffErr) {
-                mergeResult = "MERGED";
-              }
-            }
-          } else {
-            // File does not exist (perhaps deleted), treat as CLEAN / unmodified
-            mergeResult = "CLEAN";
-          }
-
-          await prisma.syncJobFile.update({
-            where: { id: jobFile.id },
-            data: { mergeResult, conflictDiff },
-          });
-        }
+        await prisma.syncJobFile.update({
+          where: { id: jobFile.id },
+          data: { mergeResult, conflictDiff },
+        });
       }
 
       await prisma.syncJob.update({
@@ -277,7 +242,7 @@ class SyncQueue {
       await prisma.syncJob.update({
         where: { id: syncJobId },
         data: {
-          status: "FAILED",
+          status: err.syncStatus === "CONFLICT" ? "CONFLICT" : "FAILED",
           errorMessage: err.message || "Unexpected apply failure",
         },
       });
@@ -359,6 +324,50 @@ class SyncQueue {
     return true;
   }
 
+  private extractConflictHunk(content: string) {
+    const lines = content.split("\n");
+    const hunkLines: string[] = [];
+    let insideConflict = false;
+
+    for (const line of lines) {
+      if (line.startsWith("<<<<<<<")) {
+        insideConflict = true;
+      }
+      if (insideConflict) {
+        hunkLines.push(line);
+      }
+      if (line.startsWith(">>>>>>>")) {
+        insideConflict = false;
+      }
+    }
+
+    return hunkLines.join("\n");
+  }
+
+  private async recordApplyConflicts(job: any, targetDir: string) {
+    let hasConflict = false;
+
+    for (const jobFile of job.files) {
+      const filePathOnDisk = path.join(targetDir, jobFile.filePath);
+      if (!fs.existsSync(filePathOnDisk)) continue;
+
+      const content = fs.readFileSync(filePathOnDisk, "utf8");
+      const isConflict = content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>");
+      if (!isConflict) continue;
+
+      hasConflict = true;
+      await prisma.syncJobFile.update({
+        where: { id: jobFile.id },
+        data: {
+          mergeResult: "CONFLICT",
+          conflictDiff: this.extractConflictHunk(content),
+        },
+      });
+    }
+
+    return hasConflict;
+  }
+
   private async runRealApply(job: any, options: ApplyOptions = {}) {
     console.log(`[SyncQueue] Running Real Apply for SyncJob ${job.id}`);
 
@@ -403,9 +412,14 @@ class SyncQueue {
 
       // 7. Apply patch
       try {
-        runGit(["apply", "--index", "--3way", patchFile], targetDir, { stdio: "ignore" });
+        runGit(["apply", "--3way", patchFile], targetDir);
+        runGit(["add", "-A"], targetDir);
       } catch (applyErr) {
-        throw new Error(`Git apply patch failed. The target branch may have changed since dry-run.`);
+        const hasConflict = await this.recordApplyConflicts(job, targetDir);
+        throw Object.assign(
+          new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
+          { syncStatus: hasConflict ? "CONFLICT" : "FAILED" }
+        );
       }
 
       // 8. Commit
