@@ -18,6 +18,7 @@ import {
 import { api, ApiError } from "../lib/api-client";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
+import { LoadingScreen } from "../components/ui/loading-screen";
 import toast from "react-hot-toast";
 
 export function RepositoryDetailPage() {
@@ -124,12 +125,7 @@ export function RepositoryDetailPage() {
   };
 
   if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center py-40 gap-3">
-        <Loader2 className="w-8 h-8 text-accent animate-spin" />
-        <p className="text-sm text-text-secondary">Retrieving repository configuration...</p>
-      </div>
-    );
+    return <LoadingScreen />;
   }
 
   if (error || !repo) {

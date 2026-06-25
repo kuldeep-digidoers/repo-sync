@@ -53,35 +53,27 @@ webhooksRouter.post("/github", async (req: Request, res: Response, next: NextFun
       return res.status(400).json({ ok: false, error: "Malformed payload: missing repository or ref" });
     }
 
-    // 3. Find registered MAIN repository
-    const mainRepo = await prisma.repository.findFirst({
+    // 3. Find registered MAIN repositories. Multiple RepoSync users can track
+    // the same GitHub repo, so each owned repository record gets its own event.
+    const mainRepos = await prisma.repository.findMany({
       where: {
         fullName: { equals: repoFullName, mode: "insensitive" },
         role: "MAIN",
         isActive: true,
+        userId: { not: null },
       },
     });
 
-    if (!mainRepo) {
+    if (mainRepos.length === 0) {
       console.log(`[Webhook Ignored] Repository ${repoFullName} is not a registered, active MAIN repository.`);
       return res.json({ ok: true, message: "Ignored: Repository not registered as MAIN" });
     }
 
-    // 4. Confirm branch matches tracked branch
-    const expectedRef = `refs/heads/${mainRepo.branch}`;
-    if (ref !== expectedRef) {
-      console.log(`[Webhook Ignored] Push to ref ${ref} does not match expected branch ref ${expectedRef}`);
-      return res.json({ ok: true, message: `Ignored: Push was on branch ${ref}, expected ${expectedRef}` });
-    }
+    const matchingRepos = mainRepos.filter((mainRepo) => ref === `refs/heads/${mainRepo.branch}`);
 
-    // 5. Check if we already processed this head commit (idempotency check)
-    const existingPush = await prisma.pushEvent.findUnique({
-      where: { commitSha: afterSha },
-    });
-
-    if (existingPush) {
-      console.log(`[Webhook Ignored] Commit ${afterSha} has already been processed.`);
-      return res.json({ ok: true, message: "Ignored: Commit already processed (idempotency check)" });
+    if (matchingRepos.length === 0) {
+      console.log(`[Webhook Ignored] Push to ref ${ref} does not match any tracked branch for ${repoFullName}`);
+      return res.json({ ok: true, message: `Ignored: Push was on branch ${ref}` });
     }
 
     // 6. Gather head commit info from the payload's commits list or head_commit
@@ -95,70 +87,88 @@ webhooksRouter.post("/github", async (req: Request, res: Response, next: NextFun
     const isBaseZero = !beforeSha || beforeSha.match(/^0+$/);
     const baseCommit = isBaseZero ? `${afterSha}~1` : beforeSha;
 
-    let comparisonFiles: any[] = [];
-    try {
-      const comparison = await GithubAppService.compareCommits(
-        mainRepo.installationId,
-        mainRepo.fullName,
-        baseCommit,
-        afterSha
-      );
-      comparisonFiles = comparison.files;
-    } catch (compareError) {
-      console.error(`Failed to retrieve git compare diff:`, compareError);
-      throw compareError;
-    }
+    const createdPushEvents = [];
 
-    // 8. Write to database: PushEvent and PushFiles in a single transaction
-    const pushEvent = await prisma.$transaction(async (tx) => {
-      // Calculate timestamp correctly
-      let pushedAtDate = new Date();
-      if (payload.repository?.pushed_at) {
-        // GitHub pushed_at can be an epoch timestamp or ISO string
-        const pushedVal = payload.repository.pushed_at;
-        pushedAtDate = typeof pushedVal === "number" ? new Date(pushedVal * 1000) : new Date(pushedVal);
-      } else if (headCommit.timestamp) {
-        pushedAtDate = new Date(headCommit.timestamp);
-      }
-
-      const event = await tx.pushEvent.create({
-        data: {
+    for (const mainRepo of matchingRepos) {
+      const existingPush = await prisma.pushEvent.findFirst({
+        where: {
           repositoryId: mainRepo.id,
           commitSha: afterSha,
-          baseSha: beforeSha,
-          branch: ref.replace("refs/heads/", ""),
-          authorName: headCommit.author?.name || headCommit.committer?.name || "Unknown Author",
-          authorEmail: headCommit.author?.email || headCommit.committer?.email || "unknown@example.com",
-          message: headCommit.message || "No commit message",
-          pushedAt: pushedAtDate,
-          status: "NEW",
         },
       });
 
-      if (comparisonFiles.length > 0) {
-        await tx.pushFile.createMany({
-          data: comparisonFiles.map((file) => ({
-            pushEventId: event.id,
-            filePath: file.filename,
-            changeType: file.status,
-            patch: file.patch || null,
-            additions: file.additions,
-            deletions: file.deletions,
-          })),
-        });
+      if (existingPush) {
+        console.log(`[Webhook Ignored] Commit ${afterSha} already processed for repository record ${mainRepo.id}.`);
+        continue;
       }
 
-      return event;
-    });
+      let comparisonFiles: any[] = [];
+      try {
+        const comparison = await GithubAppService.compareCommits(
+          mainRepo.installationId,
+          mainRepo.fullName,
+          baseCommit,
+          afterSha
+        );
+        comparisonFiles = comparison.files;
+      } catch (compareError) {
+        console.error(`Failed to retrieve git compare diff:`, compareError);
+        throw compareError;
+      }
 
-    console.log(`[Webhook Processed] Created PushEvent ID: ${pushEvent.id} for commit: ${afterSha}`);
+      const pushEvent = await prisma.$transaction(async (tx) => {
+        let pushedAtDate = new Date();
+        if (payload.repository?.pushed_at) {
+          const pushedVal = payload.repository.pushed_at;
+          pushedAtDate = typeof pushedVal === "number" ? new Date(pushedVal * 1000) : new Date(pushedVal);
+        } else if (headCommit.timestamp) {
+          pushedAtDate = new Date(headCommit.timestamp);
+        }
+
+        const event = await tx.pushEvent.create({
+          data: {
+            repositoryId: mainRepo.id,
+            commitSha: afterSha,
+            baseSha: beforeSha,
+            branch: ref.replace("refs/heads/", ""),
+            authorName: headCommit.author?.name || headCommit.committer?.name || "Unknown Author",
+            authorEmail: headCommit.author?.email || headCommit.committer?.email || "unknown@example.com",
+            message: headCommit.message || "No commit message",
+            pushedAt: pushedAtDate,
+            status: "NEW",
+          },
+        });
+
+        if (comparisonFiles.length > 0) {
+          await tx.pushFile.createMany({
+            data: comparisonFiles.map((file) => ({
+              pushEventId: event.id,
+              filePath: file.filename,
+              changeType: file.status,
+              patch: file.patch || null,
+              additions: file.additions,
+              deletions: file.deletions,
+            })),
+          });
+        }
+
+        return event;
+      });
+
+      createdPushEvents.push(pushEvent);
+      console.log(`[Webhook Processed] Created PushEvent ID: ${pushEvent.id} for commit: ${afterSha}`);
+    }
+
+    if (createdPushEvents.length === 0) {
+      return res.json({ ok: true, message: "Ignored: Commit already processed for matching repositories" });
+    }
 
     return res.status(201).json({
       ok: true,
       message: "Webhook processed and push event recorded",
       data: {
-        pushEventId: pushEvent.id,
-        commitSha: pushEvent.commitSha,
+        pushEventIds: createdPushEvents.map((event) => event.id),
+        commitSha: afterSha,
       },
     });
   } catch (error) {

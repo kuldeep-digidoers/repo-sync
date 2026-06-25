@@ -21,6 +21,7 @@ import type {
   PushEvent,
   PushStatus,
   PaginatedResponse,
+  CursorPaginatedResponse,
   SyncJob,
   CreateSyncJobsRequest,
 } from "@repo-sync/shared";
@@ -170,12 +171,16 @@ class ApiClient {
 
   async getRepoCommits(
     repoId: string,
-    branch?: string
-  ): Promise<GithubCommitSummary[]> {
+    branch?: string,
+    options: { page?: number; pageSize?: number; search?: string } = {}
+  ): Promise<CursorPaginatedResponse<GithubCommitSummary>> {
     const params = new URLSearchParams();
     if (branch) params.append("branch", branch);
+    if (options.page) params.append("page", String(options.page));
+    if (options.pageSize) params.append("pageSize", String(options.pageSize));
+    if (options.search) params.append("search", options.search);
     const query = params.toString() ? `?${params.toString()}` : "";
-    return this.request<GithubCommitSummary[]>(`/repos/${repoId}/commits${query}`);
+    return this.request<CursorPaginatedResponse<GithubCommitSummary>>(`/repos/${repoId}/commits${query}`);
   }
 
   async getCommitFiles(repoId: string, sha: string): Promise<GithubCommitDetail> {
@@ -248,6 +253,16 @@ class ApiClient {
   async retrySyncJobDryRun(id: string): Promise<SyncJob> {
     return this.request<SyncJob>(`/sync-jobs/${id}/retry-dry-run`, {
       method: "POST",
+    });
+  }
+
+  async resolveSyncJobConflict(
+    id: string,
+    data: { filePath: string; resolvedContent: string }
+  ): Promise<SyncJob> {
+    return this.request<SyncJob>(`/sync-jobs/${id}/resolve-conflict`, {
+      method: "POST",
+      body: JSON.stringify(data),
     });
   }
 

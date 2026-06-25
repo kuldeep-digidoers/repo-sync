@@ -12,6 +12,7 @@ import {
 import { api, ApiError } from "../lib/api-client";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
+import { LoadingScreen } from "../components/ui/loading-screen";
 import toast from "react-hot-toast";
 import type { UpdateGithubSettingsRequest } from "@repo-sync/shared";
 
@@ -96,12 +97,7 @@ export function SettingsPage() {
   const appReady = !!settings?.appId && !!settings?.hasPrivateKey;
 
   if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center py-40 gap-3">
-        <Loader2 className="w-8 h-8 text-accent animate-spin" />
-        <p className="text-sm text-text-secondary">Loading settings...</p>
-      </div>
-    );
+    return <LoadingScreen />;
   }
 
   return (
@@ -288,7 +284,7 @@ export function SettingsPage() {
 
 function StatusLine({ ready, text }: { ready: boolean; text: string }) {
   return (
-    <span className={`inline-flex items-center gap-1.5 text-3xs px-2 py-1 rounded border ${
+    <span className={`inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-md border font-medium leading-none ${
       ready
         ? "bg-success/10 border-success/25 text-success"
         : "bg-warning/10 border-warning/25 text-warning"

@@ -59,6 +59,14 @@ export interface PaginatedResponse<T> {
   totalPages: number;
 }
 
+export interface CursorPaginatedResponse<T> {
+  items: T[];
+  page: number;
+  pageSize: number;
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+}
+
 // ─────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────
@@ -76,6 +84,7 @@ export type RepoRole = "MAIN" | "CLIENT";
 
 export interface Repository {
   id: string;
+  userId?: string | null;
   githubOwner: string;
   githubName: string;
   fullName: string;

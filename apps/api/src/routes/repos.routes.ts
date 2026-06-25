@@ -6,6 +6,7 @@ import { validate } from "../middleware/validate.js";
 import { registerRepoSchema, updateRepoSchema } from "./repos.schemas.js";
 import type { RegisterRepoInput, UpdateRepoInput } from "./repos.schemas.js";
 import { GithubAppService } from "../lib/github-app.js";
+import type { GithubAppRepo } from "../lib/github-app.js";
 import { AppError } from "../middleware/error-handler.js";
 import { decrypt } from "../lib/encryption.js";
 
@@ -19,15 +20,32 @@ reposRouter.use(authenticate);
 // ─────────────────────────────────────────────────────────
 reposRouter.get(
   "/installable",
-  async (_req: Request, res: Response, next: NextFunction) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // Get all repositories available to the App
-      const installable = await GithubAppService.getInstallableRepositories();
+      const user = await prisma.user.findUnique({
+        where: { id: req.user!.id },
+        select: { githubToken: true },
+      });
+
+      let installable: GithubAppRepo[];
+      if (user?.githubToken) {
+        const token = decrypt(user.githubToken);
+        installable = (await GithubAppService.getAccountRepositories(token))
+          .filter((repo) => repo.appInstalled && repo.installationId)
+          .map((repo) => ({
+            githubOwner: repo.githubOwner,
+            githubName: repo.githubName,
+            fullName: repo.fullName,
+            installationId: repo.installationId!,
+          }));
+      } else {
+        installable = [];
+      }
 
       // Only hide repositories that are currently active. Inactive repos should
       // be selectable again so users can reactivate them.
       const registered = await prisma.repository.findMany({
-        where: { isActive: true },
+        where: { userId: req.user!.id, isActive: true },
         select: { fullName: true },
       });
       const registeredNames = new Set(registered.map((r) => r.fullName.toLowerCase()));
@@ -52,9 +70,21 @@ reposRouter.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const appConfigured = !(await GithubAppService.isMockMode());
-      const installableCount = appConfigured
-        ? (await GithubAppService.getInstallableRepositories()).length
-        : 0;
+      let installableCount = 0;
+
+      if (appConfigured) {
+        const user = await prisma.user.findUnique({
+          where: { id: req.user!.id },
+          select: { githubToken: true },
+        });
+
+        if (user?.githubToken) {
+          const token = decrypt(user.githubToken);
+          installableCount = (await GithubAppService.getAccountRepositories(token))
+            .filter((repo) => repo.appInstalled)
+            .length;
+        }
+      }
 
       res.json({
         ok: true,
@@ -85,29 +115,13 @@ reposRouter.get(
       });
 
       const fullName = `${req.params.owner}/${req.params.repo}`;
-      let branches;
 
-      if (user?.githubToken) {
-        try {
-          const token = decrypt(user.githubToken);
-          branches = await GithubAppService.listAccountBranches(token, fullName);
-        } catch (oauthErr) {
-          console.warn(`[Repos] OAuth branch lookup failed for ${fullName}; falling back to GitHub App`, oauthErr);
-        }
+      if (!user?.githubToken) {
+        throw AppError.badRequest("Connect your GitHub account before loading repository branches.");
       }
 
-      if (!branches) {
-        const installationId = await GithubAppService.verifyInstallation(
-          req.params.owner as string,
-          req.params.repo as string
-        );
-
-        if (!installationId) {
-          throw AppError.badRequest("GitHub App is not installed on this repository, so branches cannot be loaded.");
-        }
-
-        branches = await GithubAppService.listBranches(installationId, fullName);
-      }
+      const token = decrypt(user.githubToken);
+      const branches = await GithubAppService.listAccountBranches(token, fullName);
 
       res.json({ ok: true, data: branches });
     } catch (err) {
@@ -156,6 +170,7 @@ reposRouter.get(
       const { role, activeOnly } = req.query;
 
       const where: any = {};
+      where.userId = req.user!.id;
 
       if (role === "MAIN" || role === "CLIENT") {
         where.role = role;
@@ -201,6 +216,23 @@ reposRouter.post(
 
       const fullName = `${githubOwner}/${githubName}`.toLowerCase();
 
+      const user = await prisma.user.findUnique({
+        where: { id: req.user!.id },
+        select: { githubToken: true },
+      });
+
+      if (!user?.githubToken) {
+        throw AppError.badRequest("Connect your GitHub account before registering repositories.");
+      }
+
+      const token = decrypt(user.githubToken);
+      const accountRepos = await GithubAppService.getAccountRepositories(token);
+      const accountRepo = accountRepos.find((repo) => repo.fullName.toLowerCase() === fullName);
+
+      if (!accountRepo) {
+        throw AppError.badRequest(`Repository ${githubOwner}/${githubName} is not accessible from your GitHub account.`);
+      }
+
       // 1. Verify GitHub App is installed on this repository
       const installationId = await GithubAppService.verifyInstallation(
         githubOwner,
@@ -216,15 +248,18 @@ reposRouter.post(
       // 2. Enforce only one active MAIN repository
       if (role === "MAIN") {
         await prisma.repository.updateMany({
-          where: { role: "MAIN", isActive: true },
+          where: { userId: req.user!.id, role: "MAIN", isActive: true },
           data: { isActive: false },
         });
       }
 
       // 3. Register or reactivate repository
       // Check if it already exists (even if inactive)
-      const existing = await prisma.repository.findUnique({
-        where: { fullName },
+      const existing = await prisma.repository.findFirst({
+        where: {
+          userId: req.user!.id,
+          fullName,
+        },
       });
 
       let repo;
@@ -233,6 +268,7 @@ reposRouter.post(
         repo = await prisma.repository.update({
           where: { id: existing.id },
           data: {
+            userId: req.user!.id,
             role,
             branch,
             description,
@@ -246,6 +282,7 @@ reposRouter.post(
         // Create new record
         repo = await prisma.repository.create({
           data: {
+            userId: req.user!.id,
             githubOwner,
             githubName,
             fullName,
@@ -278,7 +315,7 @@ reposRouter.get(
         where: { id: req.params.id as string },
       });
 
-      if (!repo) {
+      if (!repo || repo.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
 
@@ -306,14 +343,19 @@ reposRouter.get(
         where: { id: req.params.id as string },
       });
 
-      if (!repo) {
+      if (!repo || repo.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
+
+      const page = Math.max(1, Number(req.query.page || 1));
+      const pageSize = Math.min(50, Math.max(10, Number(req.query.pageSize || 20)));
+      const search = typeof req.query.search === "string" ? req.query.search : undefined;
 
       const commits = await GithubAppService.listCommits(
         repo.installationId,
         repo.fullName,
-        branch || repo.branch
+        branch || repo.branch,
+        { page, pageSize, search }
       );
 
       res.json({ ok: true, data: commits });
@@ -334,7 +376,7 @@ reposRouter.get(
         where: { id: req.params.id as string },
       });
 
-      if (!repo) {
+      if (!repo || repo.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
 
@@ -362,7 +404,7 @@ reposRouter.get(
         where: { id: req.params.id as string },
       });
 
-      if (!repo) {
+      if (!repo || repo.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
 
@@ -389,7 +431,7 @@ reposRouter.patch(
         where: { id: req.params.id as string },
       });
 
-      if (!existing) {
+      if (!existing || existing.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
 
@@ -397,6 +439,7 @@ reposRouter.patch(
       if (existing.role === "MAIN" && isActive === true) {
         await prisma.repository.updateMany({
           where: {
+            userId: req.user!.id,
             role: "MAIN",
             isActive: true,
             id: { not: existing.id },
@@ -435,7 +478,7 @@ reposRouter.delete(
         where: { id: req.params.id as string },
       });
 
-      if (!existing) {
+      if (!existing || existing.userId !== req.user!.id) {
         throw AppError.notFound("Repository not found");
       }
 

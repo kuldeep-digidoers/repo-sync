@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api-client";
 import { Button } from "../components/ui/button";
+import { LoadingScreen } from "../components/ui/loading-screen";
 import toast from "react-hot-toast";
 import type { SyncJob, Repository } from "@repo-sync/shared";
 
@@ -52,6 +53,73 @@ interface CommitFileGroup {
   }>;
 }
 
+function applyConflictChoice(content: string, choice: "current" | "incoming" | "both") {
+  const lines = content.split("\n");
+  const resolved: string[] = [];
+  let current: string[] = [];
+  let incoming: string[] = [];
+  let mode: "normal" | "current" | "base" | "incoming" = "normal";
+
+  for (const line of lines) {
+    if (line.startsWith("<<<<<<<")) {
+      current = [];
+      incoming = [];
+      mode = "current";
+      continue;
+    }
+    if (mode === "current" && line.startsWith("=======")) {
+      mode = "incoming";
+      continue;
+    }
+    if (mode === "current" && line.startsWith("|||||||")) {
+      mode = "base";
+      continue;
+    }
+    if (mode === "base" && line.startsWith("=======")) {
+      mode = "incoming";
+      continue;
+    }
+    if (mode === "incoming" && line.startsWith(">>>>>>>")) {
+      if (choice === "current") resolved.push(...current);
+      if (choice === "incoming") resolved.push(...incoming);
+      if (choice === "both") resolved.push(...current, ...incoming);
+      mode = "normal";
+      continue;
+    }
+    if (mode === "current") {
+      current.push(line);
+    } else if (mode === "base") {
+      continue;
+    } else if (mode === "incoming") {
+      incoming.push(line);
+    } else {
+      resolved.push(line);
+    }
+  }
+
+  return resolved.join("\n");
+}
+
+function getFileMergeResultLabel(file: { mergeResult?: string | null; conflictDiff?: string | null }) {
+  if (
+    file.mergeResult === "MERGED" &&
+    file.conflictDiff?.startsWith("repo-sync:resolved-content:v1\n")
+  ) {
+    return "SAVED";
+  }
+
+  switch (file.mergeResult) {
+    case "CLEAN":
+      return "DIRECT";
+    case "MERGED":
+      return "AUTO-MERGE";
+    case "CONFLICT":
+      return "CONFLICT";
+    default:
+      return file.mergeResult || "PENDING";
+  }
+}
+
 export function PushEventDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -61,6 +129,14 @@ export function PushEventDetailPage() {
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [openCommitShas, setOpenCommitShas] = useState<string[]>([]);
   const defaultOpenEventIdRef = useRef<string | null>(null);
+  const [resolutionDraft, setResolutionDraft] = useState<{
+    jobId: string;
+    filePath: string;
+    content: string;
+    originalContent: string;
+    currentLabel: string;
+    incomingLabel: string;
+  } | null>(null);
 
   // Sync targeting states
   const [selectedRepoIds, setSelectedRepoIds] = useState<string[]>([]);
@@ -194,22 +270,38 @@ export function PushEventDetailPage() {
     },
   });
 
+  const resolveConflictMutation = useMutation({
+    mutationFn: (data: { jobId: string; filePath: string; resolvedContent: string }) =>
+      api.resolveSyncJobConflict(data.jobId, {
+        filePath: data.filePath,
+        resolvedContent: data.resolvedContent,
+      }),
+    onSuccess: () => {
+      toast.success("Conflict resolution saved.");
+      setResolutionDraft(null);
+      refetchSyncJobs();
+    },
+    onError: (err: any) => {
+      toast.error(err.message || "Failed to resolve conflict");
+    },
+  });
+
   // Mutation: merge clean sync jobs
   const applySyncJobsMutation = useMutation({
     mutationFn: async () => {
       const latest = await refetchSyncJobs();
-      const latestCleanJobIds = (latest.data || [])
-        .filter((job) => job.status === "CLEAN")
+      const latestMergeableJobIds = (latest.data || [])
+        .filter((job) => job.status === "CLEAN" || (job.status === "FAILED" && Boolean(job.prNumber)))
         .map((job) => job.id);
 
-      if (latestCleanJobIds.length === 0) {
+      if (latestMergeableJobIds.length === 0) {
         throw new Error("No clean sync jobs are ready to merge. Please wait for dry-run or retry it.");
       }
 
-      return api.applySyncJobs(id as string, latestCleanJobIds, { autoMerge: true });
+      return api.applySyncJobs(id as string, latestMergeableJobIds, { autoMerge: true });
     },
     onSuccess: () => {
-      toast.success("Merge request sent!");
+      toast.success("Merge check started. RepoSync will skip repos that are already up to date.");
       refetchSyncJobs();
     },
     onError: (err: any) => {
@@ -330,13 +422,38 @@ export function PushEventDetailPage() {
     });
   };
 
+  const openResolutionEditor = (job: SyncJob, filePath: string, conflictDiff: string | null) => {
+    setResolutionDraft({
+      jobId: job.id,
+      filePath,
+      content: conflictDiff || "",
+      originalContent: conflictDiff || "",
+      currentLabel: `${job.targetRepo?.fullName || "Target repo"}:${job.targetRepo?.branch || "target branch"}`,
+      incomingLabel: `${event?.repository?.fullName || "Main repo"}:${event?.branch || "source branch"}`,
+    });
+  };
+
+  const submitResolution = () => {
+    if (!resolutionDraft) return;
+    const hasConflictMarkers =
+      resolutionDraft.content.includes("<<<<<<<") ||
+      resolutionDraft.content.includes("=======") ||
+      resolutionDraft.content.includes(">>>>>>>");
+
+    if (hasConflictMarkers) {
+      toast.error("Remove all conflict markers before submitting the resolution.");
+      return;
+    }
+
+    resolveConflictMutation.mutate({
+      jobId: resolutionDraft.jobId,
+      filePath: resolutionDraft.filePath,
+      resolvedContent: resolutionDraft.content,
+    });
+  };
+
   if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center py-40 gap-3">
-        <Loader2 className="w-8 h-8 text-accent animate-spin" />
-        <p className="text-sm text-text-secondary">Retrieving commit diff details...</p>
-      </div>
-    );
+    return <LoadingScreen />;
   }
 
   if (error || !event) {
@@ -363,10 +480,13 @@ export function PushEventDetailPage() {
   const cleanJobs = syncJobs.filter(
     (job) => job.status === "CLEAN"
   );
-  const cleanJobIds = cleanJobs.map((job) => job.id);
   const failedJobs = syncJobs.filter((job) => job.status === "FAILED");
+  const recoverableFailedJobs = failedJobs.filter((job) => Boolean(job.prNumber));
+  const mergeableJobs = [...cleanJobs, ...recoverableFailedJobs];
+  const mergeableJobIds = mergeableJobs.map((job) => job.id);
   const conflictJobs = syncJobs.filter((job) => job.status === "CONFLICT");
   const appliedJobs = syncJobs.filter((job) => job.status === "APPLIED");
+  const nothingToMergeJobs = appliedJobs.filter((job) => job.errorMessage === "Already up to date");
   const pendingReviewJobs = syncJobs.filter((job) => job.status === "PENDING" || job.status === "DRY_RUN_RUNNING");
   const targetReposFromJobs = Array.from(new Map(syncJobs
     .map((job) => job.targetRepo)
@@ -697,10 +817,12 @@ export function PushEventDetailPage() {
                 <p className="text-xs text-text-secondary leading-relaxed">
                   {pendingReviewJobs.length > 0
                     ? "Dry-run is checking the selected files against the selected child repos."
-                    : cleanJobIds.length > 0
-                      ? `${cleanJobIds.length} clean repo job${cleanJobIds.length === 1 ? "" : "s"} ready to merge.`
+                    : mergeableJobIds.length > 0
+                      ? `${mergeableJobIds.length} repo job${mergeableJobIds.length === 1 ? "" : "s"} ready to merge.`
                       : appliedJobs.length > 0
-                        ? "Selected changes have already been applied."
+                        ? nothingToMergeJobs.length === appliedJobs.length
+                          ? "Nothing to merge. The selected changes are already in the child repo."
+                          : "Selected changes have already been applied."
                         : conflictJobs.length > 0
                           ? "Conflicts were found. Open Sync Targeting & Dry-Run to review them."
                           : failedJobs.length > 0
@@ -727,18 +849,18 @@ export function PushEventDetailPage() {
                 )}
                 <Button
                   onClick={() => applySyncJobsMutation.mutate()}
-                  disabled={cleanJobIds.length === 0 || applySyncJobsMutation.isPending || isAnyJobRunning}
+                  disabled={mergeableJobIds.length === 0 || applySyncJobsMutation.isPending || isAnyJobRunning}
                   className="text-xs flex items-center gap-1.5 bg-success hover:bg-success/80 text-white"
                 >
                   {applySyncJobsMutation.isPending ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Merging...
-                    </>
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Checking...
+                      </>
                   ) : (
                     <>
                       <CheckCircle2 className="w-3.5 h-3.5" />
-                      Merge Clean Repos ({cleanJobIds.length})
+                      Merge Repos ({mergeableJobIds.length})
                     </>
                   )}
                 </Button>
@@ -908,7 +1030,7 @@ export function PushEventDetailPage() {
                     Running check...
                   </span>
                 )}
-                {cleanJobIds.length > 0 && (
+                {mergeableJobIds.length > 0 && (
                   <Button
                     onClick={() => applySyncJobsMutation.mutate()}
                     disabled={applySyncJobsMutation.isPending || isAnyJobRunning}
@@ -917,12 +1039,12 @@ export function PushEventDetailPage() {
                     {applySyncJobsMutation.isPending ? (
                       <>
                         <Loader2 className="w-3 h-3 animate-spin" />
-                        Merging...
+                        Checking...
                       </>
                     ) : (
                       <>
                         <CheckCircle2 className="w-3 h-3" />
-                        Merge Clean Repos ({cleanJobIds.length})
+                        Merge Repos ({mergeableJobIds.length})
                       </>
                     )}
                   </Button>
@@ -956,15 +1078,11 @@ export function PushEventDetailPage() {
 
                         {job.status === "APPLIED" ? (
                           <div className="flex items-center gap-2">
-                            {job.targetRepo?.autoMergeEnabled ? (
-                              <span className="text-3xs bg-success/15 border border-success/20 px-2 py-0.5 rounded text-success font-semibold flex items-center gap-1">
-                                Merged ✅
-                              </span>
-                            ) : (
-                              <span className="text-3xs bg-accent/15 border border-accent/20 px-2 py-0.5 rounded text-accent font-semibold flex items-center gap-1">
-                                PR Opened 🚀
-                              </span>
-                            )}
+                            <span className="text-3xs bg-success/15 border border-success/20 px-2 py-0.5 rounded text-success font-semibold flex items-center gap-1">
+                              {job.errorMessage === "Already up to date"
+                                ? "Nothing to merge"
+                                : "Merged"}
+                            </span>
                             {job.prUrl && (
                               <a
                                 href={job.prUrl}
@@ -972,7 +1090,7 @@ export function PushEventDetailPage() {
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 text-3xs px-2.5 py-1 rounded border border-border hover:bg-card-hover text-text-secondary hover:text-text-primary transition-colors font-medium"
                               >
-                                <span>View PR #{job.prNumber}</span>
+                                <span>Details #{job.prNumber}</span>
                                 <ExternalLink className="w-3 h-3" />
                               </a>
                             )}
@@ -992,7 +1110,7 @@ export function PushEventDetailPage() {
 
                     {/* Job Files summary */}
                     <div className="space-y-4">
-                      {job.errorMessage && (
+                      {job.errorMessage && job.errorMessage !== "Already up to date" && (
                         <div className="p-3 bg-danger/10 border border-danger/20 rounded-lg text-xs text-danger flex items-start gap-2">
                           <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
                           <div className="space-y-1">
@@ -1005,6 +1123,17 @@ export function PushEventDetailPage() {
                       )}
 
                       {/* List of files status */}
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-muted">
+                        <span>
+                          <strong className="text-success">DIRECT</strong> file can be copied into the child repo without extra changes.
+                        </span>
+                        <span>
+                          <strong className="text-accent">AUTO-MERGE</strong> child repo also changed this file, but RepoSync can combine both versions safely.
+                        </span>
+                        <span>
+                          <strong className="text-warning">CONFLICT</strong> both versions changed the same lines, so you need to choose the final content.
+                        </span>
+                      </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
                         {job.files?.map((file) => {
                           const isConflict = file.mergeResult === "CONFLICT";
@@ -1026,17 +1155,25 @@ export function PushEventDetailPage() {
                                   {file.filePath}
                                 </span>
                                 <span className="text-[10px] font-bold uppercase whitespace-nowrap">
-                                  {file.mergeResult}
+                                  {getFileMergeResultLabel(file)}
                                 </span>
                               </div>
 
                               {isConflict && (
-                                <button
-                                  onClick={() => handleExcludeAndRetry(job, file.filePath)}
-                                  className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 mt-1 self-start"
-                                >
-                                  Exclude file & retry
-                                </button>
+                                <div className="flex flex-wrap items-center gap-2 mt-1">
+                                  <button
+                                    onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
+                                    className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5 self-start"
+                                  >
+                                    Resolve conflict
+                                  </button>
+                                  <button
+                                    onClick={() => handleExcludeAndRetry(job, file.filePath)}
+                                    className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 self-start"
+                                  >
+                                    Exclude file & retry
+                                  </button>
+                                </div>
                               )}
                             </div>
                           );
@@ -1053,7 +1190,7 @@ export function PushEventDetailPage() {
                               >
                                 <div className="px-3.5 py-2 bg-warning/10 border-b border-warning/20 text-warning text-xs font-semibold flex items-center gap-1.5">
                                   <AlertTriangle className="w-4 h-4" />
-                                  <span>Conflict hunk in {file.filePath}</span>
+                                  <span>Conflict content in {file.filePath}</span>
                                 </div>
                                 <div className="p-3 bg-page overflow-x-auto">
                                   <pre className="font-mono text-3xs text-warning/90 leading-relaxed select-text">
@@ -1080,6 +1217,124 @@ export function PushEventDetailPage() {
                 </p>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {resolutionDraft && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-card border border-border rounded-xl shadow-glow-lg w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-text-primary">Resolve Conflict</h3>
+                <p className="text-3xs text-text-muted font-mono truncate mt-0.5">
+                  {resolutionDraft.filePath}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setResolutionDraft(null)}
+                className="text-text-muted hover:text-text-primary transition-colors"
+              >
+                <XCircle className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                <div className="bg-page/60 border border-border rounded-lg p-3">
+                  <p className="text-3xs text-text-muted uppercase font-bold">Current child branch</p>
+                  <p className="font-mono text-text-primary truncate mt-1">{resolutionDraft.currentLabel}</p>
+                </div>
+                <div className="bg-page/60 border border-border rounded-lg p-3">
+                  <p className="text-3xs text-text-muted uppercase font-bold">Incoming main change</p>
+                  <p className="font-mono text-text-primary truncate mt-1">{resolutionDraft.incomingLabel}</p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setResolutionDraft({
+                    ...resolutionDraft,
+                    content: applyConflictChoice(resolutionDraft.originalContent, "current"),
+                  })}
+                  className="text-3xs h-8"
+                >
+                  Accept Current
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setResolutionDraft({
+                    ...resolutionDraft,
+                    content: applyConflictChoice(resolutionDraft.originalContent, "incoming"),
+                  })}
+                  className="text-3xs h-8"
+                >
+                  Accept Incoming
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setResolutionDraft({
+                    ...resolutionDraft,
+                    content: applyConflictChoice(resolutionDraft.originalContent, "both"),
+                  })}
+                  className="text-3xs h-8"
+                >
+                  Keep Both
+                </Button>
+                <span className="text-3xs text-text-muted">
+                  Or edit manually below.
+                </span>
+              </div>
+
+              <div className="text-xs text-text-secondary bg-page/60 border border-border rounded-lg p-3 leading-relaxed">
+                Choose an option, then review the final content. Save each conflicted file, then merge once all conflicts are resolved.
+              </div>
+              <textarea
+                value={resolutionDraft.content}
+                onChange={(e) => setResolutionDraft({ ...resolutionDraft, content: e.target.value })}
+                className="w-full min-h-[420px] rounded-lg bg-page border border-border hover:border-border-light focus:border-accent p-3 text-xs text-text-primary placeholder:text-text-muted focus:outline-none transition-colors resize-y font-mono leading-relaxed"
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="px-4 py-3 border-t border-border flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <p className="text-3xs text-text-muted">
+                This only saves the file resolution. Merge after every conflicted file is saved.
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setResolutionDraft(null)}
+                  className="text-xs"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={submitResolution}
+                  disabled={resolveConflictMutation.isPending}
+                  className="text-xs bg-success hover:bg-success/80 text-white flex items-center gap-1.5"
+                >
+                  {resolveConflictMutation.isPending ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Submitting...
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      Resolve & Save
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       )}

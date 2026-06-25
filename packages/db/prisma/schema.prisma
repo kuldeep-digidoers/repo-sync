@@ -21,6 +21,7 @@ model User {
   githubToken  String?  @map("github_token") // encrypted at rest
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
+  repositories Repository[]
 
   @@map("users")
 }
@@ -45,9 +46,11 @@ enum RepoRole {
 
 model Repository {
   id             String   @id @default(uuid())
+  userId         String?  @map("user_id")
+  user           User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
   githubOwner    String   @map("github_owner")
   githubName     String   @map("github_name")
-  fullName       String   @unique @map("full_name")
+  fullName       String   @map("full_name")
   installationId Int      @map("installation_id")
   role           RepoRole
   branch         String   @default("master")
@@ -60,6 +63,7 @@ model Repository {
   pushEvents     PushEvent[]
   syncJobs       SyncJob[]
 
+  @@unique([userId, fullName])
   @@map("repositories")
 }
 
@@ -77,7 +81,7 @@ model PushEvent {
   id           String     @id @default(uuid())
   repositoryId String     @map("repository_id")
   repository   Repository @relation(fields: [repositoryId], references: [id])
-  commitSha    String     @unique @map("commit_sha")
+  commitSha    String     @map("commit_sha")
   baseSha      String     @map("base_sha")
   branch       String
   authorName   String     @map("author_name")
@@ -89,6 +93,7 @@ model PushEvent {
   files        PushFile[]
   syncJobs     SyncJob[]
 
+  @@unique([repositoryId, commitSha])
   @@map("push_events")
 }
 

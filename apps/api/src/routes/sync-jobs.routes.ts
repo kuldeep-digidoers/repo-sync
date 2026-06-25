@@ -5,6 +5,7 @@ import { authenticate } from "../middleware/auth.js";
 import { AppError } from "../middleware/error-handler.js";
 import { syncQueue } from "../lib/sync-queue.js";
 import { GithubAppService } from "../lib/github-app.js";
+import type { GithubCommitSummary } from "../lib/github-app.js";
 
 export const syncJobsRouter = Router();
 
@@ -44,8 +45,11 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       return next(AppError.badRequest("Select at least one file"));
     }
 
-    const mainRepo = await prisma.repository.findUnique({
-      where: { id: mainRepoId },
+    const mainRepo = await prisma.repository.findFirst({
+      where: {
+        id: mainRepoId,
+        userId: req.user!.id,
+      },
     });
 
     if (!mainRepo || mainRepo.role !== "MAIN" || !mainRepo.isActive) {
@@ -55,6 +59,7 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
     const targetRepos = await prisma.repository.findMany({
       where: {
         id: { in: targetRepoIds },
+        userId: req.user!.id,
         role: "CLIENT",
         isActive: true,
       },
@@ -64,11 +69,24 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       return next(AppError.badRequest("Every selected child repository must be active and registered"));
     }
 
-    const branchCommits = await GithubAppService.listCommits(
-      mainRepo.installationId,
-      mainRepo.fullName,
-      mainRepo.branch
-    );
+    const branchCommits: GithubCommitSummary[] = [];
+    let commitsPage = 1;
+    let hasNextCommitPage = true;
+    while (hasNextCommitPage && commitsPage <= 20) {
+      const pageResult = await GithubAppService.listCommits(
+        mainRepo.installationId,
+        mainRepo.fullName,
+        mainRepo.branch,
+        { page: commitsPage, pageSize: 50 }
+      );
+      branchCommits.push(...pageResult.items);
+      hasNextCommitPage = pageResult.hasNextPage;
+      commitsPage += 1;
+
+      if (selectedCommitShas.every((sha) => branchCommits.some((commit) => commit.sha === sha))) {
+        break;
+      }
+    }
     const selectedIndexes = selectedCommitShas.map((sha) => branchCommits.findIndex((commit) => commit.sha === sha));
 
     if (selectedIndexes.some((index) => index === -1)) {
@@ -115,8 +133,11 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       const message = rangeCommits.length === 1
         ? newestCommit.message
         : `Manual sync range: ${rangeCommits.length} commits from ${oldestCommit.sha.substring(0, 7)} to ${newestCommit.sha.substring(0, 7)}`;
-      const existing = await tx.pushEvent.findUnique({
-        where: { commitSha: newestCommit.sha },
+      const existing = await tx.pushEvent.findFirst({
+        where: {
+          repositoryId: mainRepo.id,
+          commitSha: newestCommit.sha,
+        },
       });
 
       const event = existing
@@ -244,8 +265,13 @@ syncJobsRouter.post("/push-events/:id/sync-jobs", async (req: Request, res: Resp
     }
 
     // Verify push event exists
-    const pushEvent = await prisma.pushEvent.findUnique({
-      where: { id: pushEventId },
+    const pushEvent = await prisma.pushEvent.findFirst({
+      where: {
+        id: pushEventId,
+        repository: {
+          userId: req.user!.id,
+        },
+      },
     });
 
     if (!pushEvent) {
@@ -273,8 +299,11 @@ syncJobsRouter.post("/push-events/:id/sync-jobs", async (req: Request, res: Resp
       }
 
       // Verify target repo exists and is client
-      const targetRepo = await prisma.repository.findUnique({
-        where: { id: targetRepoId },
+      const targetRepo = await prisma.repository.findFirst({
+        where: {
+          id: targetRepoId,
+          userId: req.user!.id,
+        },
       });
 
       if (!targetRepo) {
@@ -327,8 +356,13 @@ syncJobsRouter.get("/push-events/:id/sync-jobs", async (req: Request, res: Respo
   try {
     const pushEventId = req.params.id as string;
 
-    const pushEvent = await prisma.pushEvent.findUnique({
-      where: { id: pushEventId },
+    const pushEvent = await prisma.pushEvent.findFirst({
+      where: {
+        id: pushEventId,
+        repository: {
+          userId: req.user!.id,
+        },
+      },
     });
 
     if (!pushEvent) {
@@ -336,7 +370,14 @@ syncJobsRouter.get("/push-events/:id/sync-jobs", async (req: Request, res: Respo
     }
 
     const syncJobs = await prisma.syncJob.findMany({
-      where: { pushEventId },
+      where: {
+        pushEventId,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
       include: {
         targetRepo: true,
         files: true,
@@ -363,8 +404,15 @@ syncJobsRouter.get("/sync-jobs/:id", async (req: Request, res: Response, next: N
   try {
     const id = req.params.id as string;
 
-    const syncJob = await prisma.syncJob.findUnique({
-      where: { id },
+    const syncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
       include: {
         targetRepo: true,
         pushEvent: {
@@ -397,8 +445,15 @@ syncJobsRouter.post("/sync-jobs/:id/retry-dry-run", async (req: Request, res: Re
   try {
     const id = req.params.id as string;
 
-    const syncJob = await prisma.syncJob.findUnique({
-      where: { id },
+    const syncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
     });
 
     if (!syncJob) {
@@ -436,6 +491,72 @@ syncJobsRouter.post("/sync-jobs/:id/retry-dry-run", async (req: Request, res: Re
 });
 
 /**
+ * POST /sync-jobs/:id/resolve-conflict
+ * Saves one conflicted file's resolved content for the next merge attempt.
+ */
+syncJobsRouter.post("/sync-jobs/:id/resolve-conflict", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { filePath, resolvedContent } = req.body as {
+      filePath?: string;
+      resolvedContent?: string;
+    };
+
+    if (!filePath || typeof filePath !== "string") {
+      return next(AppError.badRequest("filePath is required"));
+    }
+
+    if (typeof resolvedContent !== "string") {
+      return next(AppError.badRequest("resolvedContent is required"));
+    }
+
+    const ownedSyncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
+      select: { id: true },
+    });
+
+    if (!ownedSyncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    await syncQueue.resolveConflictFile(id, filePath, resolvedContent);
+
+    const updatedSyncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
+      include: {
+        targetRepo: true,
+        files: true,
+      },
+    });
+
+    if (!updatedSyncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    res.json({
+      ok: true,
+      data: updatedSyncJob,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /push-events/:id/apply
  * Merges a list of CLEAN SyncJobs in the background.
  */
@@ -448,8 +569,13 @@ syncJobsRouter.post("/push-events/:id/apply", async (req: Request, res: Response
       return next(AppError.badRequest("syncJobIds must be a non-empty array"));
     }
 
-    const pushEvent = await prisma.pushEvent.findUnique({
-      where: { id: pushEventId },
+    const pushEvent = await prisma.pushEvent.findFirst({
+      where: {
+        id: pushEventId,
+        repository: {
+          userId: req.user!.id,
+        },
+      },
     });
 
     if (!pushEvent) {
@@ -459,8 +585,15 @@ syncJobsRouter.post("/push-events/:id/apply", async (req: Request, res: Response
     const enqueuedJobs = [];
 
     for (const jobId of syncJobIds) {
-      const job = await prisma.syncJob.findUnique({
-        where: { id: jobId },
+      const job = await prisma.syncJob.findFirst({
+        where: {
+          id: jobId,
+          pushEvent: {
+            repository: {
+              userId: req.user!.id,
+            },
+          },
+        },
         include: {
           targetRepo: true,
           files: true,
@@ -476,7 +609,11 @@ syncJobsRouter.post("/push-events/:id/apply", async (req: Request, res: Response
       }
 
       const canApply = job.status === "CLEAN";
-      const canMergeExistingPr = Boolean(autoMerge && job.status === "APPLIED" && job.prNumber);
+      const canMergeExistingPr = Boolean(
+        autoMerge &&
+        job.prNumber &&
+        (job.status === "APPLIED" || job.status === "FAILED")
+      );
       if (!canApply && !canMergeExistingPr) {
         return next(AppError.badRequest(`Sync job ${jobId} is ${job.status}; only CLEAN jobs can be merged`));
       }
@@ -511,8 +648,15 @@ syncJobsRouter.get("/sync-jobs/:id/status", async (req: Request, res: Response, 
   try {
     const id = req.params.id as string;
 
-    const job = await prisma.syncJob.findUnique({
-      where: { id },
+    const job = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
       select: {
         id: true,
         status: true,

@@ -9,6 +9,7 @@ import {
   GitCommit,
   GitMerge,
   Loader2,
+  Search,
   Server,
 } from "lucide-react";
 import { api, ApiError } from "../lib/api-client";
@@ -23,7 +24,11 @@ export function ManualSyncPage() {
   const [mainBranch, setMainBranch] = useState("");
   const [targetRepoIds, setTargetRepoIds] = useState<string[]>([]);
   const [commitShas, setCommitShas] = useState<string[]>([]);
+  const [selectedCommitCache, setSelectedCommitCache] = useState<Record<string, any>>({});
+  const [commitPage, setCommitPage] = useState(1);
+  const [commitSearch, setCommitSearch] = useState("");
   const [filePaths, setFilePaths] = useState<string[]>([]);
+  const commitPageSize = 20;
 
   const { data: repos = [], isLoading: reposLoading } = useQuery({
     queryKey: ["repositories"],
@@ -48,11 +53,16 @@ export function ManualSyncPage() {
     }
   }, [selectedMainRepo, mainBranch]);
 
-  const { data: commits = [], isLoading: commitsLoading } = useQuery({
-    queryKey: ["repo-commits", mainRepoId, mainBranch],
-    queryFn: () => api.getRepoCommits(mainRepoId, mainBranch),
+  const { data: commitsResult, isLoading: commitsLoading, isFetching: commitsFetching } = useQuery({
+    queryKey: ["repo-commits", mainRepoId, mainBranch, commitPage, commitSearch],
+    queryFn: () => api.getRepoCommits(mainRepoId, mainBranch, {
+      page: commitPage,
+      pageSize: commitPageSize,
+      search: commitSearch.trim() || undefined,
+    }),
     enabled: step >= 2 && !!mainRepoId && !!mainBranch,
   });
+  const commits = commitsResult?.items || [];
 
   const { data: commitDetail, isLoading: filesLoading } = useQuery({
     queryKey: ["commit-files", mainRepoId, commitShas],
@@ -85,11 +95,11 @@ export function ManualSyncPage() {
   });
 
   const selectedCommits = useMemo(
-    () => commits.filter((commit) => commitShas.includes(commit.sha)),
-    [commits, commitShas]
+    () => commitShas.map((sha) => selectedCommitCache[sha]).filter(Boolean),
+    [commitShas, selectedCommitCache]
   );
   const selectedCommitIndexes = commitShas
-    .map((sha) => commits.findIndex((commit) => commit.sha === sha))
+    .map((sha) => selectedCommitCache[sha]?.listIndex)
     .filter((index) => index >= 0);
   const areSelectedCommitsContiguous =
     selectedCommitIndexes.length <= 1 ||
@@ -123,6 +133,9 @@ export function ManualSyncPage() {
   const childRepoIds = childRepos.map((repo) => repo.id);
   const areAllChildReposSelected =
     childRepoIds.length > 0 && childRepoIds.every((repoId) => targetRepoIds.includes(repoId));
+  const changedFiles = commitDetail?.files || [];
+  const areAllFilesSelected =
+    changedFiles.length > 0 && changedFiles.every((file) => filePaths.includes(file.filename));
 
   const toggleTargetRepo = (repoId: string) => {
     setTargetRepoIds((current) =>
@@ -136,12 +149,33 @@ export function ManualSyncPage() {
     setTargetRepoIds(areAllChildReposSelected ? [] : childRepoIds);
   };
 
-  const toggleCommit = (sha: string) => {
+  const resetCommitSelection = () => {
+    setCommitShas([]);
+    setSelectedCommitCache({});
+    setFilePaths([]);
+  };
+
+  const toggleCommit = (commit: any, visibleIndex: number) => {
+    const listIndex = (commitPage - 1) * commitPageSize + visibleIndex;
     setCommitShas((current) =>
-      current.includes(sha)
-        ? current.filter((item) => item !== sha)
-        : [...current, sha]
+      current.includes(commit.sha)
+        ? current.filter((item) => item !== commit.sha)
+        : [...current, commit.sha]
     );
+    setSelectedCommitCache((current) => {
+      if (current[commit.sha]) {
+        const next = { ...current };
+        delete next[commit.sha];
+        return next;
+      }
+      return {
+        ...current,
+        [commit.sha]: {
+          ...commit,
+          listIndex,
+        },
+      };
+    });
     setFilePaths([]);
   };
 
@@ -151,6 +185,10 @@ export function ManualSyncPage() {
         ? current.filter((path) => path !== filePath)
         : [...current, filePath]
     );
+  };
+
+  const toggleAllFiles = () => {
+    setFilePaths(areAllFilesSelected ? [] : changedFiles.map((file) => file.filename));
   };
 
   return (
@@ -202,8 +240,9 @@ export function ManualSyncPage() {
                   onChange={(e) => {
                     setMainRepoId(e.target.value);
                     setMainBranch("");
-                    setCommitShas([]);
-                    setFilePaths([]);
+                    setCommitPage(1);
+                    setCommitSearch("");
+                    resetCommitSelection();
                     setTargetRepoIds((ids) => ids.filter((id) => id !== e.target.value));
                   }}
                   className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent px-3 text-sm text-text-primary focus:outline-none transition-colors"
@@ -221,8 +260,9 @@ export function ManualSyncPage() {
                 value={mainBranch}
                 onChange={(e) => {
                   setMainBranch(e.target.value);
-                  setCommitShas([]);
-                  setFilePaths([]);
+                  setCommitPage(1);
+                  setCommitSearch("");
+                  resetCommitSelection();
                 }}
                 disabled={!mainRepoId || branchesLoading}
                 className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent px-3 text-sm text-text-primary focus:outline-none transition-colors disabled:opacity-60"
@@ -311,11 +351,52 @@ export function ManualSyncPage() {
             </Button>
           </div>
 
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="relative w-full md:max-w-md">
+              <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                value={commitSearch}
+                onChange={(e) => {
+                  setCommitSearch(e.target.value);
+                  setCommitPage(1);
+                }}
+                placeholder="Search current commit page by message, author, or SHA"
+                className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors"
+              />
+            </div>
+            <div className="flex items-center gap-2 text-3xs text-text-muted">
+              {commitsFetching && !commitsLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />}
+              <span>Page {commitsResult?.page || commitPage}</span>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setCommitPage((page) => Math.max(1, page - 1))}
+                disabled={!commitsResult?.hasPreviousPage || commitsFetching}
+                className="h-8 text-3xs px-2.5"
+              >
+                Previous
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setCommitPage((page) => page + 1)}
+                disabled={!commitsResult?.hasNextPage || commitsFetching}
+                className="h-8 text-3xs px-2.5"
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+
           {commitsLoading ? (
             <LoadingText text="Loading commits from GitHub..." />
+          ) : commits.length === 0 ? (
+            <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
+              No commits found on this page. Try another page or clear the search.
+            </div>
           ) : (
             <div className="space-y-2 max-h-[520px] overflow-y-auto">
-              {commits.map((commit) => (
+              {commits.map((commit, index) => (
                 <label
                   key={commit.sha}
                   className={`w-full p-4 rounded-lg border text-left transition-colors cursor-pointer flex items-start gap-3 ${
@@ -327,7 +408,7 @@ export function ManualSyncPage() {
                   <input
                     type="checkbox"
                     checked={commitShas.includes(commit.sha)}
-                    onChange={() => toggleCommit(commit.sha)}
+                    onChange={() => toggleCommit(commit, index)}
                     className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-page cursor-pointer mt-0.5"
                   />
                   <div className="min-w-0 flex-1">
@@ -353,14 +434,26 @@ export function ManualSyncPage() {
               {commitShas.length} commit{commitShas.length === 1 ? "" : "s"} selected.
               {!areSelectedCommitsContiguous && " Select every commit between the oldest and newest selected commit."}
             </p>
-            <Button
-              disabled={!canContinueFromCommit}
-              onClick={() => setStep(3)}
-              className="text-xs flex items-center gap-1.5"
-            >
-              Continue to Files
-              <ArrowRight className="w-3.5 h-3.5" />
-            </Button>
+            <div className="flex items-center gap-2">
+              {commitShas.length > 0 && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={resetCommitSelection}
+                  className="text-xs"
+                >
+                  Clear selected
+                </Button>
+              )}
+              <Button
+                disabled={!canContinueFromCommit}
+                onClick={() => setStep(3)}
+                className="text-xs flex items-center gap-1.5"
+              >
+                Continue to Files
+                <ArrowRight className="w-3.5 h-3.5" />
+              </Button>
+            </div>
           </div>
         </section>
       )}
@@ -379,17 +472,33 @@ export function ManualSyncPage() {
                 </p>
               )}
             </div>
-            <Button variant="secondary" onClick={() => setStep(2)} className="text-xs flex items-center gap-1">
-              <ArrowLeft className="w-3.5 h-3.5" />
-              Back
-            </Button>
+            <div className="flex items-center gap-2">
+              {changedFiles.length > 0 && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={toggleAllFiles}
+                  className="text-xs"
+                >
+                  {areAllFilesSelected ? "Clear all files" : "Select all files"}
+                </Button>
+              )}
+              <Button variant="secondary" onClick={() => setStep(2)} className="text-xs flex items-center gap-1">
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Back
+              </Button>
+            </div>
           </div>
 
           {filesLoading ? (
             <LoadingText text="Loading changed files..." />
+          ) : changedFiles.length === 0 ? (
+            <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
+              No changed files were returned for the selected commit range.
+            </div>
           ) : (
             <div className="space-y-2 max-h-[520px] overflow-y-auto">
-              {commitDetail?.files.map((file) => (
+              {changedFiles.map((file) => (
                 <label
                   key={file.filename}
                   className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${

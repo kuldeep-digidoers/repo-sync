@@ -434,11 +434,14 @@ export class GithubAppService {
   public static async listCommits(
     installationId: number,
     fullName: string,
-    branch: string
-  ): Promise<GithubCommitSummary[]> {
+    branch: string,
+    options: { page?: number; pageSize?: number; search?: string } = {}
+  ): Promise<{ items: GithubCommitSummary[]; page: number; pageSize: number; hasNextPage: boolean; hasPreviousPage: boolean }> {
+    const page = Math.max(1, options.page || 1);
+    const pageSize = Math.min(50, Math.max(10, options.pageSize || 20));
     const token = await this.getInstallationToken(installationId);
     const res = await fetch(
-      `https://api.github.com/repos/${fullName}/commits?sha=${encodeURIComponent(branch)}&per_page=50`,
+      `https://api.github.com/repos/${fullName}/commits?sha=${encodeURIComponent(branch)}&per_page=${pageSize}&page=${page}`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -463,14 +466,31 @@ export class GithubAppService {
       };
     }>;
 
-    return data.map((commit) => ({
+    const search = options.search?.trim().toLowerCase();
+    const commits = data.map((commit) => ({
       sha: commit.sha,
       message: commit.commit.message,
       authorName: commit.commit.author?.name || commit.commit.committer?.name || "Unknown",
       authorEmail: commit.commit.author?.email || commit.commit.committer?.email || "unknown@example.com",
       date: commit.commit.author?.date || commit.commit.committer?.date || new Date().toISOString(),
       htmlUrl: commit.html_url,
-    }));
+    })).filter((commit) => {
+      if (!search) return true;
+      return (
+        commit.sha.toLowerCase().includes(search) ||
+        commit.message.toLowerCase().includes(search) ||
+        commit.authorName.toLowerCase().includes(search) ||
+        commit.authorEmail.toLowerCase().includes(search)
+      );
+    });
+
+    return {
+      items: commits,
+      page,
+      pageSize,
+      hasNextPage: data.length === pageSize,
+      hasPreviousPage: page > 1,
+    };
   }
 
   public static async getCommit(

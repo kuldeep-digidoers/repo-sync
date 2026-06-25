@@ -15,6 +15,7 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  Search,
   Settings,
   X,
 } from "lucide-react";
@@ -37,6 +38,7 @@ export function RepositoriesPage() {
   const [customerName, setCustomerName] = useState("");
   const [description, setDescription] = useState("");
   const [branch, setBranch] = useState("master");
+  const [repoSearch, setRepoSearch] = useState("");
 
   const { data: repos = [], isLoading: reposLoading, refetch: refetchRepos } = useQuery({
     queryKey: ["repositories"],
@@ -79,6 +81,18 @@ export function RepositoriesPage() {
           private: false,
           appInstalled: true,
         }));
+  const normalizedRepoSearch = repoSearch.trim().toLowerCase();
+  const filteredPickerRepos = pickerRepos
+    .map((repo, idx) => ({ repo, idx }))
+    .filter(({ repo }) => {
+      if (!normalizedRepoSearch) return true;
+      return (
+        repo.fullName.toLowerCase().includes(normalizedRepoSearch) ||
+        repo.githubOwner.toLowerCase().includes(normalizedRepoSearch) ||
+        repo.githubName.toLowerCase().includes(normalizedRepoSearch) ||
+        repo.defaultBranch.toLowerCase().includes(normalizedRepoSearch)
+      );
+    });
 
   const registerMutation = useMutation({
     mutationFn: async (requests: RegisterRepoRequest[]) => {
@@ -113,6 +127,7 @@ export function RepositoriesPage() {
     setCustomerName("");
     setDescription("");
     setBranch("master");
+    setRepoSearch("");
   };
 
   const openModal = (nextRole: RepoRole) => {
@@ -121,6 +136,7 @@ export function RepositoriesPage() {
     setCustomerName("");
     setDescription("");
     setBranch("master");
+    setRepoSearch("");
     setStep(1);
     setIsOpen(true);
   };
@@ -256,12 +272,14 @@ export function RepositoriesPage() {
             <h2 className="text-sm font-semibold text-text-primary">GitHub Setup</h2>
             {setupLoading && <Loader2 className="w-3.5 h-3.5 text-accent animate-spin" />}
           </div>
-          <div className="flex flex-wrap gap-2 text-3xs">
-            <span className={`px-2 py-1 rounded border ${githubSetup?.githubLinked ? "bg-success/10 border-success/25 text-success" : "bg-warning/10 border-warning/25 text-warning"}`}>
-              {githubSetup?.githubLinked ? `Account linked: ${githubSetup.githubLogin}` : "GitHub account not linked"}
+          <div className="flex flex-wrap gap-2">
+            <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] font-medium leading-none ${githubSetup?.githubLinked ? "bg-success/10 border-success/20 text-success" : "bg-warning/10 border-warning/20 text-warning"}`}>
+              <span className="w-2 h-2 rounded-full bg-current" />
+              {githubSetup?.githubLinked ? `GitHub: ${githubSetup.githubLogin}` : "GitHub not linked"}
             </span>
-            <span className={`px-2 py-1 rounded border ${githubSetup?.appConfigured ? "bg-success/10 border-success/25 text-success" : "bg-danger/10 border-danger/25 text-danger"}`}>
-              {githubSetup?.appConfigured ? `GitHub App configured (${githubSetup.installableCount} repos installed)` : "GitHub App not configured"}
+            <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] font-medium leading-none ${githubSetup?.appConfigured ? "bg-success/10 border-success/20 text-success" : "bg-danger/10 border-danger/20 text-danger"}`}>
+              <span className="w-2 h-2 rounded-full bg-current" />
+              {githubSetup?.appConfigured ? `App ready: ${githubSetup.installableCount} repos` : "App not configured"}
             </span>
           </div>
         </div>
@@ -445,8 +463,7 @@ export function RepositoriesPage() {
                       <Button
                         variant="secondary"
                         onClick={() => {
-                          const selectableIndexes = pickerRepos
-                            .map((repo, idx) => ({ repo, idx }))
+                          const selectableIndexes = filteredPickerRepos
                             .filter(({ repo }) => repo.appInstalled && repo.installationId && !registeredNames.has(repo.fullName.toLowerCase()))
                             .map(({ idx }) => idx);
                           setSelectedRepoIndexes(selectableIndexes);
@@ -456,6 +473,16 @@ export function RepositoriesPage() {
                         Select all available
                       </Button>
                     )}
+                  </div>
+
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      value={repoSearch}
+                      onChange={(e) => setRepoSearch(e.target.value)}
+                      placeholder="Search repositories by name, owner, or branch"
+                      className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors"
+                    />
                   </div>
 
                   {accountReposError && (
@@ -469,9 +496,9 @@ export function RepositoriesPage() {
                       <Loader2 className="w-6 h-6 text-accent animate-spin" />
                       <p className="text-xs text-text-muted">Reading repositories from GitHub...</p>
                     </div>
-                  ) : pickerRepos.length > 0 ? (
+                  ) : filteredPickerRepos.length > 0 ? (
                     <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1 border border-border p-2 rounded-lg bg-page/50">
-                      {pickerRepos.map((repo, idx) => {
+                      {filteredPickerRepos.map(({ repo, idx }) => {
                         const alreadyLinked = registeredNames.has(repo.fullName.toLowerCase());
                         const selectable = repo.appInstalled && !!repo.installationId && !alreadyLinked;
                         const selected = selectedRepoIndexes.includes(idx);
@@ -518,9 +545,13 @@ export function RepositoriesPage() {
                   ) : (
                     <div className="border border-border/80 rounded-xl p-4 text-center space-y-2 bg-page/40">
                       <AlertCircle className="w-8 h-8 text-warning mx-auto" />
-                      <h3 className="text-xs font-semibold text-text-primary">No Repositories Found</h3>
+                      <h3 className="text-xs font-semibold text-text-primary">
+                        {pickerRepos.length > 0 ? "No Matching Repositories" : "No Repositories Found"}
+                      </h3>
                       <p className="text-3xs text-text-muted leading-relaxed max-w-xs mx-auto">
-                        Configure GitHub in Settings, connect your GitHub account, and install the GitHub App on the repos you want to sync.
+                        {pickerRepos.length > 0
+                          ? "Try a different repository name, owner, or branch."
+                          : "Configure GitHub in Settings, connect your GitHub account, and install the GitHub App on the repos you want to sync."}
                       </p>
                     </div>
                   )}

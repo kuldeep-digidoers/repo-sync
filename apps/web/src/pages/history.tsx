@@ -426,10 +426,10 @@ export function HistoryPage() {
                                           </div>
                                         </div>
 
-                                        <div className="flex items-center gap-3.5">
+                                        <div className="flex items-center gap-2">
                                           {/* Status Badge */}
                                           <span
-                                            className={`inline-flex items-center gap-1 text-3xs font-semibold px-2.5 py-0.5 rounded-full border uppercase ${getJobStatusBadge(
+                                            className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded-md border uppercase leading-none ${getJobStatusBadge(
                                               job.status
                                             )}`}
                                           >
@@ -442,9 +442,9 @@ export function HistoryPage() {
                                               href={job.prUrl}
                                               target="_blank"
                                               rel="noopener noreferrer"
-                                              className="inline-flex items-center gap-1 text-3xs bg-page hover:bg-card-hover border border-border px-2.5 py-1 rounded text-accent hover:text-accent-light transition-colors font-medium"
+                                              className="inline-flex items-center gap-1 text-[11px] bg-page hover:bg-card-hover border border-border px-2 py-1 rounded-md text-accent hover:text-accent-light transition-colors font-medium leading-none"
                                             >
-                                              <span>PR #{job.prNumber}</span>
+                                              <span>PR#{job.prNumber}</span>
                                               <ExternalLink className="w-3 h-3" />
                                             </a>
                                           )}

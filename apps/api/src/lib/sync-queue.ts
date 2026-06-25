@@ -18,15 +18,29 @@ function sanitizeBranchPart(value: string) {
   return value.replace(/[^a-zA-Z0-9._/-]/g, "-").replace(/\/+/g, "/").replace(/^-+|-+$/g, "");
 }
 
+function safeRepoPath(value: string) {
+  const normalized = path.posix.normalize(value.replace(/\\/g, "/"));
+  if (normalized.startsWith("../") || normalized === ".." || path.posix.isAbsolute(normalized)) {
+    throw new Error("Invalid repository file path.");
+  }
+  return normalized;
+}
+
 function formatGitError(err: any) {
   const stderr = err?.stderr?.toString?.().trim();
   const stdout = err?.stdout?.toString?.().trim();
   return stderr || stdout || err?.message || "Unknown git error";
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 type ApplyOptions = {
   autoMerge?: boolean;
 };
+
+const RESOLVED_CONTENT_PREFIX = "repo-sync:resolved-content:v1\n";
 
 class SyncQueue {
   private activeJobs = new Set<string>();
@@ -158,7 +172,7 @@ class SyncQueue {
           if (content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>")) {
             mergeResult = "CONFLICT";
             hasConflict = true;
-            conflictDiff = this.extractConflictHunk(content);
+            conflictDiff = content;
           }
         }
 
@@ -194,6 +208,66 @@ class SyncQueue {
     });
   }
 
+  public async resolveConflictFile(
+    syncJobId: string,
+    filePath: string,
+    resolvedContent: string
+  ) {
+    try {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: syncJobId },
+        include: {
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      if (!job) {
+        throw new Error("Sync job not found");
+      }
+
+      if (job.status !== "CONFLICT" && job.status !== "FAILED") {
+        throw new Error(`Only conflicted jobs can be resolved. Current status is ${job.status}.`);
+      }
+
+      if (!job.files.some((file: any) => file.filePath === filePath && file.mergeResult === "CONFLICT")) {
+        throw new Error("Selected file is not marked as a conflict for this sync job.");
+      }
+
+      if (await GithubAppService.isMockMode()) {
+        throw new Error("GitHub App is not configured. Conflict resolution requires real repository access.");
+      }
+
+      await prisma.syncJobFile.updateMany({
+        where: {
+          syncJobId,
+          filePath,
+        },
+        data: {
+          mergeResult: "MERGED",
+          conflictDiff: `${RESOLVED_CONTENT_PREFIX}${resolvedContent}`,
+        },
+      });
+
+      const remainingConflicts = await prisma.syncJobFile.count({
+        where: {
+          syncJobId,
+          mergeResult: "CONFLICT",
+        },
+      });
+
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: {
+          status: remainingConflicts > 0 ? "CONFLICT" : "CLEAN",
+          errorMessage: null,
+        },
+      });
+    } catch (err: any) {
+      throw err;
+    }
+  }
+
   private async processApply(syncJobId: string, options: ApplyOptions = {}) {
     if (this.activeJobs.has(syncJobId)) return;
     this.activeJobs.add(syncJobId);
@@ -219,7 +293,12 @@ class SyncQueue {
         return;
       }
 
-      if (job.status !== "CLEAN" && !(options.autoMerge && job.status === "APPLIED" && job.prNumber)) {
+      const canMergeExistingPr =
+        options.autoMerge &&
+        Boolean(job.prNumber) &&
+        (job.status === "APPLIED" || job.status === "FAILED");
+
+      if (job.status !== "CLEAN" && !canMergeExistingPr) {
         throw new Error(`Only CLEAN sync jobs can be applied. Current status is ${job.status}.`);
       }
 
@@ -232,7 +311,7 @@ class SyncQueue {
         data: { status: "APPLYING", errorMessage: null },
       });
 
-      if (options.autoMerge && job.status === "APPLIED" && job.prNumber) {
+      if (canMergeExistingPr) {
         await this.mergeExistingPullRequest(job, true);
       } else {
         await this.runRealApply(job, options);
@@ -288,40 +367,72 @@ class SyncQueue {
     const targetRepo = job.targetRepo;
     const targetToken = await GithubAppService.getInstallationToken(targetRepo.installationId);
     const mergeUrl = `https://api.github.com/repos/${targetRepo.fullName}/pulls/${job.prNumber}/merge`;
-    const mergeResponse = await fetch(mergeUrl, {
-      method: "PUT",
-      headers: {
-        "Authorization": `Bearer ${targetToken}`,
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Repo-Sync-Bot",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        merge_method: "squash",
-        commit_title: `Merge pull request #${job.prNumber} from ${job.branchName || "repo-sync"}`,
-      }),
-    });
+    const pullUrl = `https://api.github.com/repos/${targetRepo.fullName}/pulls/${job.prNumber}`;
+    const headers = {
+      "Authorization": `Bearer ${targetToken}`,
+      "Accept": "application/vnd.github.v3+json",
+      "User-Agent": "Repo-Sync-Bot",
+      "Content-Type": "application/json",
+    };
 
-    if (!mergeResponse.ok) {
-      const errText = await mergeResponse.text();
-      const message = `GitHub PR merge failed for #${job.prNumber}: ${errText}`;
-      if (required) {
-        throw new Error(message);
+    const getPullRequest = async () => {
+      const response = await fetch(pullUrl, { headers });
+      if (!response.ok) return null;
+      return response.json() as Promise<any>;
+    };
+
+    const markMerged = async () => {
+      await prisma.syncJob.update({
+        where: { id: job.id },
+        data: {
+          status: "APPLIED",
+          errorMessage: null,
+        },
+      });
+
+      console.log(`[SyncQueue] PR #${job.prNumber} merged for SyncJob ${job.id}.`);
+      return true;
+    };
+
+    let lastMessage = "";
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const pullBefore = await getPullRequest();
+      if (pullBefore?.merged) {
+        return markMerged();
       }
-      console.warn(`[SyncQueue] ${message}`);
-      return false;
+
+      const mergeResponse = await fetch(mergeUrl, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({
+          merge_method: "squash",
+          commit_title: `Merge pull request #${job.prNumber} from ${job.branchName || "repo-sync"}`,
+        }),
+      });
+
+      if (mergeResponse.ok) {
+        return markMerged();
+      }
+
+      const errText = await mergeResponse.text();
+      lastMessage = `GitHub PR merge failed for #${job.prNumber}: ${errText}`;
+
+      await sleep(1200);
+      const pullAfter = await getPullRequest();
+      if (pullAfter?.merged) {
+        return markMerged();
+      }
+
+      const isRetryable = mergeResponse.status === 405 || mergeResponse.status === 409;
+      if (!isRetryable) break;
     }
 
-    await prisma.syncJob.update({
-      where: { id: job.id },
-      data: {
-        status: "APPLIED",
-        errorMessage: null,
-      },
-    });
+    if (required) {
+      throw new Error(lastMessage || `GitHub PR merge failed for #${job.prNumber}.`);
+    }
 
-    console.log(`[SyncQueue] PR #${job.prNumber} merged for SyncJob ${job.id}.`);
-    return true;
+    console.warn(`[SyncQueue] ${lastMessage}`);
+    return false;
   }
 
   private extractConflictHunk(content: string) {
@@ -360,12 +471,34 @@ class SyncQueue {
         where: { id: jobFile.id },
         data: {
           mergeResult: "CONFLICT",
-          conflictDiff: this.extractConflictHunk(content),
+          conflictDiff: content,
         },
       });
     }
 
     return hasConflict;
+  }
+
+  private applySavedResolvedFiles(job: any, targetDir: string) {
+    let appliedAny = false;
+
+    for (const jobFile of job.files) {
+      if (
+        jobFile.mergeResult !== "MERGED" ||
+        typeof jobFile.conflictDiff !== "string" ||
+        !jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)
+      ) {
+        continue;
+      }
+
+      const safePath = safeRepoPath(jobFile.filePath);
+      const filePathOnDisk = path.join(targetDir, safePath);
+      fs.mkdirSync(path.dirname(filePathOnDisk), { recursive: true });
+      fs.writeFileSync(filePathOnDisk, jobFile.conflictDiff.slice(RESOLVED_CONTENT_PREFIX.length));
+      appliedAny = true;
+    }
+
+    return appliedAny;
   }
 
   private async runRealApply(job: any, options: ApplyOptions = {}) {
@@ -402,7 +535,27 @@ class SyncQueue {
       fs.writeFileSync(patchFile, selectedPatch);
 
       if (selectedPatch.trim().length === 0) {
-        throw new Error("Selected files produced an empty patch; refusing to create an empty sync PR.");
+        await prisma.syncJobFile.updateMany({
+          where: { syncJobId: jobId },
+          data: {
+            mergeResult: "CLEAN",
+            conflictDiff: null,
+          },
+        });
+
+        await prisma.syncJob.update({
+          where: { id: jobId },
+          data: {
+            status: "APPLIED",
+            branchName: null,
+            prUrl: null,
+            prNumber: null,
+            errorMessage: "Already up to date",
+          },
+        });
+
+        console.log(`[SyncQueue] Real Apply skipped for SyncJob ${jobId}. Empty patch; already up to date.`);
+        return;
       }
 
       // 6. Create sync branch
@@ -410,16 +563,65 @@ class SyncQueue {
       const branchName = sanitizeBranchPart(`sync/main-${shortSha}-${jobId.substring(0, 8)}`);
       runGit(["checkout", "-b", branchName], targetDir);
 
-      // 7. Apply patch
+      // 7. Apply patch. If the user saved conflict resolutions, those files
+      // override the patch result before we stage and commit.
       try {
         runGit(["apply", "--3way", patchFile], targetDir);
+        this.applySavedResolvedFiles(job, targetDir);
         runGit(["add", "-A"], targetDir);
       } catch (applyErr) {
-        const hasConflict = await this.recordApplyConflicts(job, targetDir);
-        throw Object.assign(
-          new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
-          { syncStatus: hasConflict ? "CONFLICT" : "FAILED" }
-        );
+        const usedSavedResolutions = this.applySavedResolvedFiles(job, targetDir);
+        if (usedSavedResolutions) {
+          const hasRemainingConflict = await this.recordApplyConflicts(job, targetDir);
+          if (!hasRemainingConflict) {
+            runGit(["add", "-A"], targetDir);
+          } else {
+            throw Object.assign(
+              new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
+              { syncStatus: "CONFLICT" }
+            );
+          }
+        } else {
+          const hasConflict = await this.recordApplyConflicts(job, targetDir);
+          throw Object.assign(
+            new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
+            { syncStatus: hasConflict ? "CONFLICT" : "FAILED" }
+          );
+        }
+      }
+
+      let hasStagedChanges = true;
+      try {
+        runGit(["diff", "--cached", "--quiet"], targetDir);
+        hasStagedChanges = false;
+      } catch (diffErr: any) {
+        if (diffErr?.status !== 1) {
+          throw diffErr;
+        }
+      }
+
+      if (!hasStagedChanges) {
+        await prisma.syncJobFile.updateMany({
+          where: { syncJobId: jobId },
+          data: {
+            mergeResult: "CLEAN",
+            conflictDiff: null,
+          },
+        });
+
+        await prisma.syncJob.update({
+          where: { id: jobId },
+          data: {
+            status: "APPLIED",
+            branchName: null,
+            prUrl: null,
+            prNumber: null,
+            errorMessage: "Already up to date",
+          },
+        });
+
+        console.log(`[SyncQueue] Real Apply skipped for SyncJob ${jobId}. Already up to date.`);
+        return;
       }
 
       // 8. Commit
@@ -478,6 +680,11 @@ class SyncQueue {
         );
       }
 
+      await prisma.syncJobFile.updateMany({
+        where: { syncJobId: jobId },
+        data: { conflictDiff: null },
+      });
+
       // 12. Save results
       await prisma.syncJob.update({
         where: { id: jobId },
@@ -499,6 +706,7 @@ class SyncQueue {
       }
     }
   }
+
 }
 
 export const syncQueue = new SyncQueue();

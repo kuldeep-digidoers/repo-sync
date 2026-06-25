@@ -32,7 +32,11 @@ pushEventsRouter.get("/", async (req: Request, res: Response, next: NextFunction
       return next(AppError.badRequest("Invalid pageSize query parameter"));
     }
 
-    const whereClause: any = {};
+    const whereClause: any = {
+      repository: {
+        userId: req.user!.id,
+      },
+    };
     if (status) {
       if (!["NEW", "TRIAGED", "COMPLETED"].includes(status)) {
         return next(AppError.badRequest("Invalid status query parameter"));
@@ -46,6 +50,9 @@ pushEventsRouter.get("/", async (req: Request, res: Response, next: NextFunction
       whereClause.syncJobs = {
         some: {
           targetRepoId,
+          targetRepo: {
+            userId: req.user!.id,
+          },
         },
       };
     }
@@ -112,8 +119,13 @@ pushEventsRouter.get("/:id", async (req: Request, res: Response, next: NextFunct
   try {
     const id = req.params.id as string;
 
-    const pushEvent = await prisma.pushEvent.findUnique({
-      where: { id },
+    const pushEvent = await prisma.pushEvent.findFirst({
+      where: {
+        id,
+        repository: {
+          userId: req.user!.id,
+        },
+      },
       include: {
         repository: true,
         files: true,
@@ -139,11 +151,13 @@ pushEventsRouter.get("/:id", async (req: Request, res: Response, next: NextFunct
 
     try {
       const selectedFilePaths = new Set(pushEvent.files.map((file) => file.filePath));
-      const branchCommits = await GithubAppService.listCommits(
+      const branchCommitsResult = await GithubAppService.listCommits(
         pushEvent.repository.installationId,
         pushEvent.repository.fullName,
-        pushEvent.branch
+        pushEvent.branch,
+        { pageSize: 50 }
       );
+      const branchCommits = branchCommitsResult.items;
       const headIndex = branchCommits.findIndex((commit) => commit.sha === pushEvent.commitSha);
 
       if (headIndex >= 0) {
@@ -203,8 +217,13 @@ pushEventsRouter.post("/:id/triage", async (req: Request, res: Response, next: N
   try {
     const id = req.params.id as string;
 
-    const pushEvent = await prisma.pushEvent.findUnique({
-      where: { id },
+    const pushEvent = await prisma.pushEvent.findFirst({
+      where: {
+        id,
+        repository: {
+          userId: req.user!.id,
+        },
+      },
     });
 
     if (!pushEvent) {
