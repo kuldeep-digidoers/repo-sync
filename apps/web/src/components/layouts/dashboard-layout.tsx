@@ -81,7 +81,7 @@ export function DashboardLayout() {
               <GitMerge className="w-4 h-4 text-accent" />
             </div>
             <span className="font-semibold text-text-primary text-sm">
-              RepoSync
+              RepoBridge
             </span>
           </div>
           <button

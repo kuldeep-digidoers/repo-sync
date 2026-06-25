@@ -82,7 +82,7 @@ export function SignupPage() {
               <GitMerge className="w-5 h-5 text-accent" />
             </div>
             <span className="text-xl font-semibold text-text-primary">
-              RepoSync
+              RepoBridge
             </span>
           </div>
           <h1 className="text-4xl font-bold text-text-primary mb-4 leading-tight">
@@ -91,7 +91,7 @@ export function SignupPage() {
             <span className="text-gradient">in minutes.</span>
           </h1>
           <p className="text-text-secondary text-lg max-w-md leading-relaxed">
-            Create your account, connect your GitHub repos, and let RepoSync
+            Create your account, connect your GitHub repos, and let RepoBridge
             handle the complexity of multi-repo synchronization.
           </p>
 
@@ -124,7 +124,7 @@ export function SignupPage() {
               <GitMerge className="w-5 h-5 text-accent" />
             </div>
             <span className="text-xl font-semibold text-text-primary">
-              RepoSync
+              RepoBridge
             </span>
           </div>
 

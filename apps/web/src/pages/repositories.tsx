@@ -429,7 +429,7 @@ export function RepositoriesPage() {
                     selected={role === "MAIN"}
                     icon={<GitFork className="w-4 h-4 text-accent" />}
                     title="Main Source"
-                    body="One upstream repository that RepoSync watches for push events."
+                    body="One upstream repository that RepoBridge watches for push events."
                     onClick={() => {
                       setRole("MAIN");
                       setSelectedRepoIndexes([]);

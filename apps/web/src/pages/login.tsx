@@ -85,7 +85,7 @@ export function LoginPage() {
               <GitMerge className="w-5 h-5 text-accent" />
             </div>
             <span className="text-xl font-semibold text-text-primary">
-              RepoSync
+              RepoBridge
             </span>
           </div>
           <h1 className="text-4xl font-bold text-text-primary mb-4 leading-tight">
@@ -124,7 +124,7 @@ export function LoginPage() {
               <GitMerge className="w-5 h-5 text-accent" />
             </div>
             <span className="text-xl font-semibold text-text-primary">
-              RepoSync
+              RepoBridge
             </span>
           </div>
 

@@ -12,7 +12,7 @@ export function LoadingScreen() {
         </div>
         <div className="flex flex-col items-center gap-1">
           <span className="text-sm font-medium text-text-primary">
-            RepoSync
+            RepoBridge
           </span>
           <span className="text-xs text-text-muted">Loading…</span>
         </div>

@@ -393,7 +393,7 @@ export function PushEventDetailPage() {
       return api.applySyncJobs(id as string, latestMergeableJobIds, { autoMerge: true });
     },
     onSuccess: () => {
-      toast.success("Merge check started. RepoSync will skip repos that are already up to date.");
+      toast.success("Merge check started. RepoBridge will skip repos that are already up to date.");
       refetchSyncJobs();
     },
     onError: (err: any) => {
@@ -1232,7 +1232,7 @@ export function PushEventDetailPage() {
                           <strong className="text-success">DIRECT</strong> file can be copied into the child repo without extra changes.
                         </span>
                         <span>
-                          <strong className="text-accent">AUTO-MERGE</strong> child repo also changed this file, but RepoSync can combine both versions safely.
+                          <strong className="text-accent">AUTO-MERGE</strong> child repo also changed this file, but RepoBridge can combine both versions safely.
                         </span>
                         <span>
                           <strong className="text-warning">CONFLICT</strong> both versions changed the same lines, so you need to choose the final content.
