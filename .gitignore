@@ -9,3 +9,6 @@ coverage/
 .turbo/
 packages/db/src/generated/
 apps/api/temp-jobs/
+state.md
+details.txt
+project-detail.md
