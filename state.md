@@ -20,7 +20,7 @@ repo-sync/
     └── shared/                # Common TypeScript interfaces and API contract schemas
 ```
 
----
+--- 
 
 ## ⚡ Current System Status
 
