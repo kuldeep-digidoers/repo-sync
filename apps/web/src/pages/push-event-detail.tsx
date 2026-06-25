@@ -24,6 +24,7 @@ import {
   RotateCcw,
   AlertTriangle,
   XCircle,
+  Undo2,
 } from "lucide-react";
 import { api } from "../lib/api-client";
 import { Button } from "../components/ui/button";
@@ -100,6 +101,90 @@ function applyConflictChoice(content: string, choice: "current" | "incoming" | "
   return resolved.join("\n");
 }
 
+/**
+ * Renders conflict diff content as an array of React elements with color-coded
+ * conflict sections. Non-conflict lines use default styling; conflict markers
+ * and their content are highlighted with distinct colors per side.
+ */
+function renderConflictDiff(
+  content: string,
+  currentLabel: string,
+  incomingLabel: string
+) {
+  const lines = content.split("\n");
+  const elements: React.ReactNode[] = [];
+  let mode: "normal" | "current" | "base" | "incoming" = "normal";
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith("<<<<<<<")) {
+      mode = "current";
+      elements.push(
+        <div key={i} className="bg-red-500/15 text-red-400 border-l-2 border-red-500 pl-2 -mx-3 px-3 py-0.5 font-bold">
+          {`<<<<<<< ${currentLabel} (target branch)`}
+        </div>
+      );
+      continue;
+    }
+    if (mode === "current" && line.startsWith("|||||||")) {
+      mode = "base";
+      elements.push(
+        <div key={i} className="bg-text-muted/10 text-text-muted border-l-2 border-text-muted pl-2 -mx-3 px-3 py-0.5 font-bold">
+          ||||||| common ancestor
+        </div>
+      );
+      continue;
+    }
+    if ((mode === "current" || mode === "base") && line.startsWith("=======")) {
+      mode = "incoming";
+      elements.push(
+        <div key={i} className="bg-text-muted/10 text-text-muted border-l-2 border-text-muted pl-2 -mx-3 px-3 py-0.5 font-bold">
+          =======
+        </div>
+      );
+      continue;
+    }
+    if (mode === "incoming" && line.startsWith(">>>>>>>")) {
+      elements.push(
+        <div key={i} className="bg-blue-500/15 text-blue-400 border-l-2 border-blue-500 pl-2 -mx-3 px-3 py-0.5 font-bold">
+          {`>>>>>>> ${incomingLabel} (source branch)`}
+        </div>
+      );
+      mode = "normal";
+      continue;
+    }
+
+    if (mode === "current") {
+      elements.push(
+        <div key={i} className="bg-red-500/8 text-red-300 border-l-2 border-red-500/40 pl-2 -mx-3 px-3">
+          {line || " "}
+        </div>
+      );
+    } else if (mode === "base") {
+      elements.push(
+        <div key={i} className="bg-text-muted/5 text-text-muted/60 border-l-2 border-text-muted/20 pl-2 -mx-3 px-3 line-through">
+          {line || " "}
+        </div>
+      );
+    } else if (mode === "incoming") {
+      elements.push(
+        <div key={i} className="bg-blue-500/8 text-blue-300 border-l-2 border-blue-500/40 pl-2 -mx-3 px-3">
+          {line || " "}
+        </div>
+      );
+    } else {
+      elements.push(
+        <div key={i} className="text-text-secondary">
+          {line || " "}
+        </div>
+      );
+    }
+  }
+
+  return elements;
+}
+
 function getFileMergeResultLabel(file: { mergeResult?: string | null; conflictDiff?: string | null }) {
   if (
     file.mergeResult === "MERGED" &&
@@ -129,6 +214,7 @@ export function PushEventDetailPage() {
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [openCommitShas, setOpenCommitShas] = useState<string[]>([]);
   const defaultOpenEventIdRef = useRef<string | null>(null);
+  const fileSelectionInitializedRef = useRef<string | null>(null);
   const [resolutionDraft, setResolutionDraft] = useState<{
     jobId: string;
     filePath: string;
@@ -225,8 +311,13 @@ export function PushEventDetailPage() {
     }
   }, [event, selectedFileId]);
 
-  // Initialize file selections when repositories and files are loaded
+  // Initialize file selections when repositories and files are loaded.
+  // Only run once per push event (or when event/repositories actually change),
+  // NOT on every syncJobs poll update, to avoid resetting user selections.
+  const fileInitKey = `${event?.id}:${clientRepos.map((r) => r.id).sort().join(",")}`;
   useEffect(() => {
+    if (fileSelectionInitializedRef.current === fileInitKey) return;
+
     const targetRepos = Array.from(new Map(syncJobs
       .map((job) => job.targetRepo)
       .filter((repo): repo is Repository => Boolean(repo?.id))
@@ -242,8 +333,9 @@ export function PushEventDetailPage() {
       });
       setFileSelection(initialSelection);
       setSelectedRepoIds(visibleClientRepos.map((repo) => repo.id));
+      fileSelectionInitializedRef.current = fileInitKey;
     }
-  }, [event, repositories, syncJobs]);
+  }, [event, repositories, syncJobs, fileInitKey]);
 
   // Mutation: Create Sync Jobs (Dry Run)
   const createSyncJobsMutation = useMutation({
@@ -1110,17 +1202,29 @@ export function PushEventDetailPage() {
 
                     {/* Job Files summary */}
                     <div className="space-y-4">
-                      {job.errorMessage && job.errorMessage !== "Already up to date" && (
-                        <div className="p-3 bg-danger/10 border border-danger/20 rounded-lg text-xs text-danger flex items-start gap-2">
-                          <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-                          <div className="space-y-1">
-                            <p className="font-semibold">
-                              {job.status === "CONFLICT" ? "Merge conflict:" : "Dry-run failure:"}
-                            </p>
-                            <p className="font-mono text-3xs leading-relaxed">{job.errorMessage}</p>
+                      {job.errorMessage && job.errorMessage !== "Already up to date" && (() => {
+                        const isApplyStage = Boolean(job.branchName || job.prNumber);
+                        const isWarning = job.status === "APPLIED";
+                        const errorLabel = job.status === "CONFLICT"
+                          ? "Merge conflict:"
+                          : isApplyStage
+                            ? "Apply failure:"
+                            : "Dry-run failure:";
+                        const colorClass = isWarning
+                          ? "bg-warning/10 border-warning/20 text-warning"
+                          : "bg-danger/10 border-danger/20 text-danger";
+                        return (
+                          <div className={`p-3 ${colorClass} rounded-lg text-xs flex items-start gap-2`}>
+                            <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                            <div className="space-y-1">
+                              <p className="font-semibold">
+                                {isWarning ? "Note:" : errorLabel}
+                              </p>
+                              <p className="font-mono text-3xs leading-relaxed">{job.errorMessage}</p>
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
 
                       {/* List of files status */}
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-muted">
@@ -1183,6 +1287,8 @@ export function PushEventDetailPage() {
                         {/* Conflict Diff Box */}
                         {job.files?.map((file) => {
                           if (file.mergeResult === "CONFLICT" && file.conflictDiff) {
+                            const targetLabel = `${job.targetRepo?.fullName || "target"}:${job.targetRepo?.branch || "branch"}`;
+                            const sourceLabel = `${event?.repository?.fullName || "main"}:${event?.branch || "branch"}`;
                             return (
                               <div
                                 key={file.id}
@@ -1190,11 +1296,23 @@ export function PushEventDetailPage() {
                               >
                                 <div className="px-3.5 py-2 bg-warning/10 border-b border-warning/20 text-warning text-xs font-semibold flex items-center gap-1.5">
                                   <AlertTriangle className="w-4 h-4" />
-                                  <span>Conflict content in {file.filePath}</span>
+                                  <span>Conflict in {file.filePath}</span>
+                                </div>
+                                <div className="px-2.5 py-1.5 bg-page/80 border-b border-border flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px]">
+                                  <span className="flex items-center gap-1">
+                                    <span className="w-2.5 h-2.5 rounded-sm bg-red-500/40 border border-red-500/60 inline-block" />
+                                    <span className="text-red-400 font-semibold">{targetLabel}</span>
+                                    <span className="text-text-muted">(target branch)</span>
+                                  </span>
+                                  <span className="flex items-center gap-1">
+                                    <span className="w-2.5 h-2.5 rounded-sm bg-blue-500/40 border border-blue-500/60 inline-block" />
+                                    <span className="text-blue-400 font-semibold">{sourceLabel}</span>
+                                    <span className="text-text-muted">(source branch)</span>
+                                  </span>
                                 </div>
                                 <div className="p-3 bg-page overflow-x-auto">
-                                  <pre className="font-mono text-3xs text-warning/90 leading-relaxed select-text">
-                                    {file.conflictDiff}
+                                  <pre className="font-mono text-3xs leading-relaxed select-text space-y-0">
+                                    {renderConflictDiff(file.conflictDiff, targetLabel, sourceLabel)}
                                   </pre>
                                 </div>
                               </div>
@@ -1242,53 +1360,76 @@ export function PushEventDetailPage() {
 
             <div className="p-4 space-y-3 overflow-y-auto">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
-                <div className="bg-page/60 border border-border rounded-lg p-3">
-                  <p className="text-3xs text-text-muted uppercase font-bold">Current child branch</p>
+                <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3">
+                  <p className="text-3xs text-red-400 uppercase font-bold flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-sm bg-red-500/50 border border-red-500 inline-block" />
+                    Target Branch (will be modified)
+                  </p>
                   <p className="font-mono text-text-primary truncate mt-1">{resolutionDraft.currentLabel}</p>
                 </div>
-                <div className="bg-page/60 border border-border rounded-lg p-3">
-                  <p className="text-3xs text-text-muted uppercase font-bold">Incoming main change</p>
+                <div className="bg-blue-500/5 border border-blue-500/20 rounded-lg p-3">
+                  <p className="text-3xs text-blue-400 uppercase font-bold flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-sm bg-blue-500/50 border border-blue-500 inline-block" />
+                    Source Branch (incoming changes)
+                  </p>
                   <p className="font-mono text-text-primary truncate mt-1">{resolutionDraft.incomingLabel}</p>
                 </div>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => setResolutionDraft({
-                    ...resolutionDraft,
-                    content: applyConflictChoice(resolutionDraft.originalContent, "current"),
-                  })}
-                  className="text-3xs h-8"
-                >
-                  Accept Current
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => setResolutionDraft({
-                    ...resolutionDraft,
-                    content: applyConflictChoice(resolutionDraft.originalContent, "incoming"),
-                  })}
-                  className="text-3xs h-8"
-                >
-                  Accept Incoming
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => setResolutionDraft({
-                    ...resolutionDraft,
-                    content: applyConflictChoice(resolutionDraft.originalContent, "both"),
-                  })}
-                  className="text-3xs h-8"
-                >
-                  Keep Both
-                </Button>
-                <span className="text-3xs text-text-muted">
-                  Or edit manually below.
-                </span>
+                {resolutionDraft.content === resolutionDraft.originalContent ? (
+                  <>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => setResolutionDraft({
+                        ...resolutionDraft,
+                        content: applyConflictChoice(resolutionDraft.originalContent, "current"),
+                      })}
+                      className="text-3xs h-8 border-red-500/30 hover:border-red-500/50 text-red-400 hover:bg-red-500/10"
+                    >
+                      Accept Target ({resolutionDraft.currentLabel.split(":")[0]?.split("/").pop() || "target"})
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => setResolutionDraft({
+                        ...resolutionDraft,
+                        content: applyConflictChoice(resolutionDraft.originalContent, "incoming"),
+                      })}
+                      className="text-3xs h-8 border-blue-500/30 hover:border-blue-500/50 text-blue-400 hover:bg-blue-500/10"
+                    >
+                      Accept Source ({resolutionDraft.incomingLabel.split(":")[0]?.split("/").pop() || "source"})
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => setResolutionDraft({
+                        ...resolutionDraft,
+                        content: applyConflictChoice(resolutionDraft.originalContent, "both"),
+                      })}
+                      className="text-3xs h-8"
+                    >
+                      Keep Both
+                    </Button>
+                    <span className="text-3xs text-text-muted">
+                      Or edit manually below.
+                    </span>
+                  </>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => setResolutionDraft({
+                      ...resolutionDraft,
+                      content: resolutionDraft.originalContent,
+                    })}
+                    className="text-3xs h-8 border-warning/30 hover:border-warning/50 text-warning hover:bg-warning/10 flex items-center gap-1.5"
+                  >
+                    <Undo2 className="w-3.5 h-3.5" />
+                    Undo &mdash; Revert to Original Conflict
+                  </Button>
+                )}
               </div>
 
               <div className="text-xs text-text-secondary bg-page/60 border border-border rounded-lg p-3 leading-relaxed">

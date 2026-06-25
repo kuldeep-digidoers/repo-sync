@@ -376,9 +376,14 @@ class SyncQueue {
     };
 
     const getPullRequest = async () => {
-      const response = await fetch(pullUrl, { headers });
-      if (!response.ok) return null;
-      return response.json() as Promise<any>;
+      try {
+        const response = await fetch(pullUrl, { headers });
+        if (!response.ok) return null;
+        return response.json() as Promise<any>;
+      } catch (fetchErr: any) {
+        console.warn(`[SyncQueue] Network error fetching PR #${job.prNumber}: ${fetchErr.message}`);
+        return null;
+      }
     };
 
     const markMerged = async () => {
@@ -401,14 +406,21 @@ class SyncQueue {
         return markMerged();
       }
 
-      const mergeResponse = await fetch(mergeUrl, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({
-          merge_method: "squash",
-          commit_title: `Merge pull request #${job.prNumber} from ${job.branchName || "repo-sync"}`,
-        }),
-      });
+      let mergeResponse: Response;
+      try {
+        mergeResponse = await fetch(mergeUrl, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            merge_method: "squash",
+            commit_title: `Merge pull request #${job.prNumber} from ${job.branchName || "repo-sync"}`,
+          }),
+        });
+      } catch (fetchErr: any) {
+        lastMessage = `Network error while merging PR #${job.prNumber} for ${targetRepo.fullName}: ${fetchErr?.cause?.message || fetchErr.message || "connection failed"}`;
+        await sleep(1200);
+        continue;
+      }
 
       if (mergeResponse.ok) {
         return markMerged();
@@ -637,21 +649,26 @@ class SyncQueue {
       const prBody = `Automated sync from main repository.\n\nSynced files:\n${fileListMarkdown}\n\nLink to original push: ${linkBack}`;
 
       const pullsUrl = `https://api.github.com/repos/${targetRepo.fullName}/pulls`;
-      const prResponse = await fetch(pullsUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${targetToken}`,
-          "Accept": "application/vnd.github.v3+json",
-          "User-Agent": "Repo-Sync-Bot",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: commitMsg,
-          head: branchName,
-          base: targetRepo.branch,
-          body: prBody,
-        }),
-      });
+      let prResponse: Response;
+      try {
+        prResponse = await fetch(pullsUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetToken}`,
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Repo-Sync-Bot",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: commitMsg,
+            head: branchName,
+            base: targetRepo.branch,
+            body: prBody,
+          }),
+        });
+      } catch (fetchErr: any) {
+        throw new Error(`Network error while creating Pull Request for ${targetRepo.fullName}: ${fetchErr?.cause?.message || fetchErr.message || "connection failed"}`);
+      }
 
       if (!prResponse.ok) {
         const errText = await prResponse.text();
@@ -673,11 +690,20 @@ class SyncQueue {
 
       // 11. Optionally auto-merge the Pull Request
       const shouldMerge = options.autoMerge || targetRepo.autoMergeEnabled;
+      let mergeWarning: string | null = null;
       if (shouldMerge) {
-        await this.mergeExistingPullRequest(
-          { ...job, prNumber, branchName, targetRepo },
-          Boolean(options.autoMerge)
-        );
+        try {
+          await this.mergeExistingPullRequest(
+            { ...job, prNumber, branchName, targetRepo },
+            Boolean(options.autoMerge)
+          );
+        } catch (mergeErr: any) {
+          // PR was created but merge failed — still mark as APPLIED so the
+          // user can merge the PR manually on GitHub, instead of marking the
+          // entire job as FAILED which is misleading.
+          console.warn(`[SyncQueue] PR #${prNumber} created but auto-merge failed for SyncJob ${jobId}:`, mergeErr);
+          mergeWarning = `PR #${prNumber} created but auto-merge failed: ${mergeErr?.cause?.message || mergeErr.message || "merge request failed"}. Merge the PR manually on GitHub.`;
+        }
       }
 
       await prisma.syncJobFile.updateMany({
@@ -693,6 +719,7 @@ class SyncQueue {
           branchName,
           prUrl,
           prNumber,
+          errorMessage: mergeWarning,
         },
       });
 

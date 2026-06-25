@@ -90,9 +90,8 @@ export function StatusBadge({
   if (!config) {
     return (
       <span
-        className={`inline-flex items-center gap-1 font-semibold px-2 py-1 rounded-md border border-border bg-page/50 text-text-secondary uppercase leading-none ${
-          size === "sm" ? "text-[11px]" : "text-2xs"
-        } ${className}`}
+        className={`inline-flex items-center gap-1 font-semibold px-2 py-1 rounded-md border border-border bg-page/50 text-text-secondary uppercase leading-none ${size === "sm" ? "text-[11px]" : "text-2xs"
+          } ${className}`}
       >
         {status}
       </span>
@@ -103,9 +102,8 @@ export function StatusBadge({
 
   return (
     <span
-      className={`inline-flex items-center gap-1 font-semibold px-2 py-1 rounded-md border uppercase leading-none ${config.bg} ${
-        size === "sm" ? "text-[11px]" : "text-2xs"
-      } ${className}`}
+      className={`inline-flex items-center gap-1 font-semibold px-2 py-1 rounded-md border uppercase leading-none ${config.bg} ${size === "sm" ? "text-[11px]" : "text-2xs"
+        } ${className}`}
     >
       {showIcon && config.icon}
       {label}

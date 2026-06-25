@@ -315,17 +315,22 @@ export class GithubAppService {
     }
 
     const appJwt = await this.getAppJwt();
-    const tokenRes = await fetch(
-      `https://api.github.com/app/installations/${installationId}/access_tokens`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${appJwt}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "RepoSync-App",
-        },
-      }
-    );
+    let tokenRes: Response;
+    try {
+      tokenRes = await fetch(
+        `https://api.github.com/app/installations/${installationId}/access_tokens`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${appJwt}`,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "RepoSync-App",
+          },
+        }
+      );
+    } catch (fetchErr: any) {
+      throw new Error(`Network error fetching GitHub installation token (installation ${installationId}): ${fetchErr?.cause?.message || fetchErr.message || "connection failed"}`);
+    }
 
     if (!tokenRes.ok) {
       const errText = await tokenRes.text();
